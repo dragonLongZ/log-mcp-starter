@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "log-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\REPLACE\\WITH\\ABSOLUTE\\PATH\\log-mcp-starter",
+        "run",
+        "python",
+        "mcp_server.py"
+      ]
+    }
+  }
+}
