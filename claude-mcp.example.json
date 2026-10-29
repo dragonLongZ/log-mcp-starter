@@ -4,7 +4,7 @@
       "command": "uv",
       "args": [
         "--directory",
-        "C:\\REPLACE\\WITH\\ABSOLUTE\\PATH\\log-mcp-starter",
+        "D:/pythonProject/log-mcp-starter",
         "run",
         "python",
         "mcp_server.py"

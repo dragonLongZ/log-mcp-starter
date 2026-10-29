@@ -1,0 +1,14 @@
+# 统一行尾：所有文本文件使用 LF（跨平台兼容，避免 Windows/Linux 行尾漂移）
+* text=auto eol=lf
+
+# 常见二进制文件：不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.pyc binary
+*.pyo binary
+*.zip binary
+*.gz binary

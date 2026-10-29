@@ -1,8 +1,9 @@
-"""Interactive JumpServer SSH session and directory-discovery log bridge.
+"""交互式 JumpServer SSH 会话与目录发现式日志桥接服务（多资产版）。
 
-The user configures only an allowlisted module log_dir. The bridge discovers
-files under that directory at query time; it does not require filename templates.
-Run in a dedicated terminal and complete the normal password/MFA flow.
+每个配置的资产（target）携带自己的 ssh_username，按需建立独立 SSH 连接
+（密码/MFA 在本专用终端完成）。后台心跳任务维持已建立会话的活性，
+防止 JumpServer 空闲超时断连。自由格式的只读查询在下发执行前，
+由 command_guard 进行静态校验。请在独立终端中运行本文件。
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import shlex
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncssh
@@ -22,6 +23,8 @@ import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 import uvicorn
+
+from command_guard import CommandValidationError, validate_query_command
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
@@ -32,8 +35,13 @@ MAX_MATCHES = 200
 MAX_DISCOVERY_FILES = 2_000
 MAX_FILES_PER_QUERY = 50
 MAX_DEPTH = 5
+MAX_SERVERS_PER_QUERY = 10
+DEFAULT_KEEPALIVE_MINUTES = 25
+QUERY_TIMEOUT_SECONDS = 60
 
-# Common text-log suffixes plus recognizable names without a conventional suffix.
+AssetState = Literal["disconnected", "connecting", "connected", "needs_reauth"]
+
+# 常见文本日志后缀，以及无常规后缀但可识别的日志名标记。
 TEXT_SUFFIXES = {".log", ".out", ".txt", ".json", ".jsonl", ".trace", ".csv"}
 LOG_NAME_MARKERS = (
     "log", "info", "error", "err", "warn", "debug", "trace", "fatal",
@@ -46,14 +54,28 @@ INFO_MARKERS = ("info", "stdout", "access")
 
 
 def load_config() -> dict[str, Any]:
+    """加载并校验配置：每个资产必须有 ssh_username，心跳间隔须在 1-60 分钟。"""
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     if not isinstance(config, dict) or "jumpserver" not in config or "targets" not in config:
         raise RuntimeError(f"Invalid configuration: {CONFIG_PATH}")
+    for name, target in (config["targets"] or {}).items():
+        if not str((target or {}).get("ssh_username", "")).strip():
+            raise RuntimeError(
+                f"Target '{name}' is missing 'ssh_username'. Migration: move the old "
+                "jumpserver.username into each target as ssh_username."
+            )
+    try:
+        interval = int(config["jumpserver"].get("keepalive_interval_minutes", DEFAULT_KEEPALIVE_MINUTES))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("jumpserver.keepalive_interval_minutes must be an integer between 1 and 60.") from exc
+    if not 1 <= interval <= 60:
+        raise RuntimeError("jumpserver.keepalive_interval_minutes must be between 1 and 60.")
     return config
 
 
 def read_token() -> str:
+    """读取本地 bearer token（由 create_token.py 生成，不入库）。"""
     if not TOKEN_PATH.exists():
         raise RuntimeError("local.token is missing. Run `uv run python create_token.py` first.")
     token = TOKEN_PATH.read_text(encoding="utf-8").strip()
@@ -63,13 +85,15 @@ def read_token() -> str:
 
 
 class ConsoleMFA(asyncssh.SSHClient):
-    """Prompt in this dedicated terminal and reuse password if requested again."""
-    def __init__(self) -> None:
+    """在本专用终端弹出认证提示；密码按资产独立缓存复用。"""
+
+    def __init__(self, server: str) -> None:
+        self._server = server
         self._password: str | None = None
 
     def password_auth_requested(self) -> str:
         if self._password is None:
-            self._password = getpass.getpass("JumpServer password: ")
+            self._password = getpass.getpass(f"[{self._server}] JumpServer password: ")
         return self._password
 
     def kbdint_auth_requested(self) -> str:
@@ -83,28 +107,246 @@ class ConsoleMFA(asyncssh.SSHClient):
             print(instructions)
         answers: list[str] = []
         for prompt, echo in prompts:
+            labeled = f"[{self._server}] {prompt}"
             lowered = prompt.lower()
             if "password" in lowered:
                 answer = self.password_auth_requested()
-            elif any(word in lowered for word in ("otp", "mfa", "verification", "code", "验证码")):
-                answer = input(prompt) if echo else getpass.getpass(prompt)
             else:
-                answer = input(prompt) if echo else getpass.getpass(prompt)
+                # OTP/MFA/验证码等其他键盘交互提示。
+                answer = input(labeled) if echo else getpass.getpass(labeled)
             answers.append(answer)
         return answers
 
 
+class AssetConnection:
+    """单个资产的 SSH 连接：独立状态机、独立锁、独立 MFA 提示器。"""
+
+    def __init__(self, server: str, ssh_username: str, host: str, port: int) -> None:
+        self.server = server
+        self.ssh_username = ssh_username
+        self.host = host
+        self.port = port
+        self.state: AssetState = "disconnected"
+        self.conn: asyncssh.SSHClientConnection | None = None
+        self.lock = asyncio.Lock()
+        self.last_heartbeat: str | None = None
+        self.disconnect_reason: str | None = None
+        self._mfa = ConsoleMFA(server)
+
+    def mark_disconnected(self, reason: str) -> None:
+        """标记连接失效，记录原因与时间，状态转为 needs_reauth。"""
+        self.conn = None
+        self.state = "needs_reauth"
+        stamped = datetime.now().isoformat(timespec="seconds")
+        self.disconnect_reason = f"{reason} (at {stamped})"[:300]
+
+    def is_live(self) -> bool:
+        return self.state == "connected" and self.conn is not None and not self.conn.is_closed()
+
+    def status_payload(self) -> dict[str, Any]:
+        if self.state == "connected" and not self.is_live():
+            self.mark_disconnected("SSH connection closed")
+        return {
+            "server": self.server,
+            "state": self.state,
+            "last_heartbeat": self.last_heartbeat,
+            "disconnect_reason": self.disconnect_reason,
+        }
+
+    async def connect(self) -> None:
+        """在后台任务中执行；密码/MFA 提示出现在 gateway 终端。"""
+        try:
+            print(f"[{self.server}] Connecting to JumpServer; complete password/MFA in this terminal.")
+            conn = await asyncssh.connect(
+                self.host,
+                port=self.port,
+                username=self.ssh_username,
+                client_factory=lambda: self._mfa,
+                password_auth=True,
+                kbdint_auth=True,
+                client_keys=[],
+                agent_path=None,
+                # 传输层 keepalive，与应用层心跳命令互补。
+                keepalive_interval=30,
+                keepalive_count_max=3,
+            )
+        except asyncio.CancelledError:
+            self.state = "disconnected"
+            raise
+        except (asyncssh.Error, OSError) as exc:
+            self.state = "needs_reauth"
+            self.disconnect_reason = f"connect failed: {type(exc).__name__}: {exc}"[:300]
+            print(f"[{self.server}] Connection failed: {self.disconnect_reason}")
+            return
+        self.conn = conn
+        self.state = "connected"
+        self.disconnect_reason = None
+        self.last_heartbeat = None
+        conn.add_disconnect_handler(lambda _conn: self.mark_disconnected("SSH connection closed by remote or network"))
+        print(f"[{self.server}] SSH authentication succeeded; the connection is kept alive by heartbeat.")
+
+
+class ConnectionManager:
+    """按资产维护连接池；认证与查询解耦（查询不阻塞等待 MFA）。"""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        jump = config["jumpserver"]
+        host = str(jump["host"])
+        port = int(jump.get("port", 2222))
+        self._assets: dict[str, AssetConnection] = {
+            name: AssetConnection(name, str(target["ssh_username"]), host, port)
+            for name, target in config["targets"].items()
+        }
+        # 同一时间只允许一个资产进行 MFA 认证，避免终端提示交错。
+        self._auth_semaphore = asyncio.Semaphore(1)
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        # 保护 sync_config，避免并发请求同时重建同一资产条目。
+        self._sync_lock = asyncio.Lock()
+
+    @property
+    def assets(self) -> dict[str, AssetConnection]:
+        return self._assets
+
+    async def sync_config(self, config: dict[str, Any]) -> None:
+        """按磁盘最新配置热同步连接池。
+
+        - 新增资产：创建 disconnected 条目，立即可认证；
+        - 移除资产：删除条目并关闭其连接；
+        - ssh_username/host/port 变更：重建条目（旧连接关闭，需重新认证）。
+        修改配置无需重启 gateway。
+        """
+        jump = config["jumpserver"]
+        host = str(jump["host"])
+        port = int(jump.get("port", 2222))
+        desired = {
+            name: (str(target["ssh_username"]), host, port)
+            for name, target in config["targets"].items()
+        }
+        async with self._sync_lock:
+            for name in list(self._assets.keys()):
+                asset = self._assets[name]
+                if name not in desired:
+                    self._assets.pop(name)
+                    await self._retire(asset)
+                elif (asset.ssh_username, asset.host, asset.port) != desired[name]:
+                    self._assets[name] = AssetConnection(name, *desired[name])
+                    await self._retire(asset)
+            for name, params in desired.items():
+                if name not in self._assets:
+                    self._assets[name] = AssetConnection(name, *params)
+
+    async def _retire(self, asset: AssetConnection) -> None:
+        """关闭被移除/重建资产的连接并取消其认证任务。"""
+        task = self._tasks.pop(asset.server, None)
+        if task is not None and not task.done():
+            task.cancel()
+        if asset.conn is not None:
+            asset.conn.close()
+            try:
+                await asset.conn.wait_closed()
+            except (asyncssh.Error, OSError):
+                pass
+
+    def require_connected(self, server: str) -> AssetConnection:
+        """取指定资产的可用连接；未连接时抛 404/409 并附操作指引。"""
+        asset = self._assets.get(server)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Unknown server; not in the allowlist")
+        if asset.is_live():
+            assert asset.conn is not None
+            return asset
+        if asset.state == "connected":
+            asset.mark_disconnected("SSH connection closed")
+        if asset.state == "connecting":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Authentication in progress for '{server}'. Complete password/MFA in the "
+                    "gateway terminal, then retry the query."
+                ),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Asset '{server}' is not connected (state: {asset.state}). Call "
+                f"reconnect_asset('{server}') and complete password/MFA in the gateway terminal."
+            ),
+        )
+
+    def request_connect(self, server: str) -> dict[str, Any]:
+        """触发指定资产的后台重连；已有认证任务在跑时去重返回。"""
+        asset = self._assets.get(server)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Unknown server; not in the allowlist")
+        task = self._tasks.get(server)
+        if task is not None and not task.done():
+            return asset.status_payload() | {
+                "note": f"Authentication already in progress for '{server}'. Complete password/MFA in the gateway terminal."
+            }
+        if asset.is_live():
+            return asset.status_payload() | {"note": "Already connected."}
+        asset.state = "connecting"
+        asset.disconnect_reason = None
+        self._tasks[server] = asyncio.create_task(self._connect_guarded(asset))
+        return asset.status_payload() | {
+            "note": f"Connecting to '{server}'. Complete password/MFA in the gateway terminal now."
+        }
+
+    async def _connect_guarded(self, asset: AssetConnection) -> None:
+        async with self._auth_semaphore:
+            await asset.connect()
+
+    def connected_assets(self) -> list[AssetConnection]:
+        return [asset for asset in self._assets.values() if asset.is_live()]
+
+    def statuses(self) -> list[dict[str, Any]]:
+        return [asset.status_payload() for asset in self._assets.values()]
+
+    async def close_all(self) -> None:
+        """关闭全部连接与认证任务（gateway 退出时调用）。"""
+        for task in self._tasks.values():
+            task.cancel()
+        for asset in self._assets.values():
+            if asset.conn is not None:
+                asset.conn.close()
+                try:
+                    await asset.conn.wait_closed()
+                except (asyncssh.Error, OSError):
+                    pass
+
+
+async def heartbeat_loop(manager: ConnectionManager, interval_minutes: int) -> None:
+    """应用层保活：周期性在每条活动会话上执行 `true`。
+
+    与 asyncssh 传输层 keepalive 互补；JumpServer 的空闲超时以命令活动为准，
+    因此需要真实（但零输出）的命令来重置计时。心跳失败即标记资产为需重新认证。
+    """
+    interval = max(60, interval_minutes * 60)
+    while True:
+        await asyncio.sleep(interval)
+        for asset in manager.connected_assets():
+            try:
+                async with asset.lock:
+                    if asset.conn is None or asset.conn.is_closed():
+                        raise OSError("connection closed")
+                    await asset.conn.run("true", check=False, timeout=15)
+                asset.last_heartbeat = datetime.now().isoformat(timespec="seconds")
+            except (asyncssh.Error, asyncio.TimeoutError, OSError) as exc:
+                asset.mark_disconnected(f"keepalive failed: {type(exc).__name__}: {exc}")
+                print(f"[{asset.server}] {asset.disconnect_reason}")
+
+
 class BaseLogRequest(BaseModel):
-    server: str = Field(min_length=1, max_length=100)
+    servers: list[str] = Field(min_length=1, max_length=MAX_SERVERS_PER_QUERY)
     module: str = Field(min_length=1, max_length=100)
     day: str = Field(default="yesterday", min_length=1, max_length=10)
     log_type: Literal["info", "error", "both"] = "both"
-    # Optional opaque IDs returned by discover_log_files; never raw paths.
+    # 可选的不透明 ID（由 discover_log_files 返回）；绝不接受原始路径。
     file_ids: list[str] | None = Field(default=None, max_length=MAX_FILES_PER_QUERY)
 
 
 class DiscoverRequest(BaseModel):
-    server: str = Field(min_length=1, max_length=100)
+    servers: list[str] = Field(min_length=1, max_length=MAX_SERVERS_PER_QUERY)
     module: str = Field(min_length=1, max_length=100)
     day: str = Field(default="yesterday", min_length=1, max_length=10)
     log_type: Literal["info", "error", "both"] = "both"
@@ -120,7 +362,18 @@ class SearchRequest(BaseLogRequest):
     max_results: int = Field(default=100, ge=1, le=MAX_MATCHES)
 
 
+class ExecuteQueryRequest(BaseModel):
+    servers: list[str] = Field(min_length=1, max_length=MAX_SERVERS_PER_QUERY)
+    module: str = Field(min_length=1, max_length=100)
+    command: str = Field(min_length=1, max_length=2000)
+
+
+class ConnectRequest(BaseModel):
+    server: str = Field(min_length=1, max_length=100)
+
+
 def check_bearer(authorization: str | None = Header(default=None)) -> None:
+    """校验请求携带的 bearer token（本地 bridge 的唯一鉴权）。"""
     expected = read_token()
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -129,20 +382,50 @@ def check_bearer(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
+async def get_synced_config(request: Request) -> dict[str, Any]:
+    """FastAPI 依赖：每次请求热读配置并同步连接池。
+
+    保证配置文件的新增/删除/凭据变更立即生效，无需重启 gateway；
+    同时消除"配置热读、连接池快照"两者不一致的问题。
+    """
+    config = load_config()
+    await request.app.state.manager.sync_config(config)
+    return config
+
+
+def unique_servers(servers: list[str]) -> list[str]:
+    """去重并保持顺序。"""
+    return list(dict.fromkeys(servers))
+
+
+async def fan_out(
+    servers: list[str], handler: Callable[[str], Awaitable[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """按资产并行执行 handler；单个资产失败转为该资产的 error 条目，不阻断其他资产。"""
+
+    async def one(server: str) -> dict[str, Any]:
+        try:
+            payload = await handler(server)
+            return {"server": server, **payload}
+        except HTTPException as exc:
+            return {"server": server, "error": f"HTTP {exc.status_code}: {exc.detail}"}
+
+    return list(await asyncio.gather(*(one(server) for server in servers)))
+
+
 def resolve_target_module(config: dict[str, Any], server: str, module: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    active = config["jumpserver"]["active_target"]
-    if server != active:
-        raise HTTPException(status_code=400, detail=f"This SSH session is connected to '{active}', not '{server}'. This starter supports one active asset.")
+    """白名单校验：资产与模块必须已在配置中登记。"""
     target = config["targets"].get(server)
     if not target:
         raise HTTPException(status_code=404, detail="Unknown server; not in the allowlist")
     module_config = (target.get("modules") or {}).get(module)
     if not module_config:
-        raise HTTPException(status_code=404, detail="Unknown module; not in the allowlist")
+        raise HTTPException(status_code=404, detail=f"Unknown module '{module}' for server '{server}'; not in the allowlist")
     return target, module_config
 
 
 def normalize_log_dir(module_config: dict[str, Any], module: str) -> str:
+    """校验并规范化配置的 log_dir：必须为绝对路径且不含 '..'。"""
     log_dir = str(module_config.get("log_dir", "")).strip()
     if not log_dir.startswith("/") or "\n" in log_dir or "\r" in log_dir:
         raise HTTPException(status_code=400, detail=f"Configure an absolute Linux log_dir for module '{module}'.")
@@ -152,6 +435,7 @@ def normalize_log_dir(module_config: dict[str, Any], module: str) -> str:
 
 
 def resolve_requested_date(config: dict[str, Any], module_config: dict[str, Any], day_arg: str) -> tuple[date, str]:
+    """把 today/yesterday/YYYY-MM-DD 解析为配置时区下的具体日期。"""
     timezone_name = str(module_config.get("timezone") or config.get("log_timezone") or "UTC")
     try:
         tz = ZoneInfo(timezone_name)
@@ -172,7 +456,7 @@ def resolve_requested_date(config: dict[str, Any], module_config: dict[str, Any]
 
 
 def parse_date_hint(path: str) -> str | None:
-    """Find common date tokens anywhere in the relative path, including directory names."""
+    """在相对路径任意位置（含目录名）识别常见日期格式，返回 ISO 日期或 None。"""
     import re
     name = PurePosixPath(path).as_posix()
     patterns = (
@@ -194,16 +478,18 @@ def is_compressed(path: str) -> bool:
 
 
 def is_log_candidate(path: str) -> bool:
+    """判断文件是否像日志：文本后缀或名称含日志标记。"""
     name = PurePosixPath(path).as_posix().lower()
     basename = PurePosixPath(path).name.lower()
     if is_compressed(path):
-        # Compressed files are discoverable for transparency but not searched by this starter.
+        # 压缩文件可被发现，配合 execute_query 的 zgrep/zcat 查询。
         return any(marker in name for marker in LOG_NAME_MARKERS) or ".log" in basename
     suffix = PurePosixPath(basename).suffix
     return suffix in TEXT_SUFFIXES or any(marker in name for marker in LOG_NAME_MARKERS)
 
 
 def infer_kind(path: str) -> str:
+    """按文件名标记推断日志类型：error / info / generic。"""
     name = PurePosixPath(path).as_posix().lower()
     if any(marker in name for marker in ERROR_MARKERS):
         return "error"
@@ -216,50 +502,53 @@ def matches_type(path: str, log_type: str) -> bool:
     if log_type == "both":
         return True
     kind = infer_kind(path)
-    # Include generic app.log/server.log in either search; exclude clearly typed opposite streams.
+    # 通用的 app.log/server.log 两类搜索都纳入；仅排除明确属于另一类型的文件。
     if log_type == "error":
         return kind != "info"
     return kind != "error"
 
 
 def file_id_for(server: str, module: str, relative_path: str) -> str:
+    """生成不透明 file_id（含 server，因此多资产批量查询时各资产只匹配自己的 ID）。"""
     return hashlib.sha256(f"{server}\0{module}\0{relative_path}".encode("utf-8")).hexdigest()[:16]
 
 
-async def get_connection(app: FastAPI) -> asyncssh.SSHClientConnection:
-    conn: asyncssh.SSHClientConnection | None = getattr(app.state, "ssh_conn", None)
-    if conn is None or conn.is_closed():
-        raise HTTPException(status_code=503, detail="SSH session is closed. Restart gateway_host.py and complete MFA again.")
-    return conn
-
-
-async def run_remote(app: FastAPI, command: str, timeout: int = 30) -> asyncssh.SSHCompletedProcess[str]:
-    conn = await get_connection(app)
-    lock: asyncio.Lock = app.state.ssh_lock
+async def run_remote(app: FastAPI, server: str, command: str, timeout: int = 30) -> asyncssh.SSHCompletedProcess[str]:
+    """在指定资产的 SSH 会话上执行命令（持该资产的锁，串行化）。"""
+    manager: ConnectionManager = app.state.manager
+    asset = manager.require_connected(server)
     try:
-        async with lock:
-            return await conn.run(command, check=False, timeout=timeout)
+        async with asset.lock:
+            if asset.conn is None or asset.conn.is_closed():
+                asset.mark_disconnected("SSH connection closed")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Asset '{server}' connection closed. Call reconnect_asset('{server}') and complete MFA in the gateway terminal.",
+                )
+            return await asset.conn.run(command, check=False, timeout=timeout)
     except (asyncssh.Error, asyncio.TimeoutError) as exc:
-        raise HTTPException(status_code=502, detail=f"Remote log operation failed: {type(exc).__name__}") from exc
+        asset.mark_disconnected(f"remote operation failed: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail=f"Remote log operation failed on '{server}': {type(exc).__name__}") from exc
 
 
 async def discover_remote_files(
     app: FastAPI, config: dict[str, Any], server: str, module: str,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], bool]:
+    """在远程 log_dir 下执行受限 find，返回带元信息与推断结果的候选文件列表。"""
     _, module_config = resolve_target_module(config, server, module)
     log_dir = normalize_log_dir(module_config, module)
-    # The only path in the command comes from the server-side allowlist.
+    # 命令中唯一的路径来自服务端白名单配置，模型无法注入。
     command = (
         f"find {shlex.quote(log_dir)} -maxdepth {MAX_DEPTH} -type f "
         "-printf '%p\\t%s\\t%T@\\n' 2>/dev/null "
         f"| head -n {MAX_DISCOVERY_FILES}"
     )
-    result = await run_remote(app, command, timeout=30)
+    result = await run_remote(app, server, command, timeout=30)
     if result.exit_status not in (0, None):
         detail = (result.stderr or "Unable to list the configured log directory").strip()[:1000]
         raise HTTPException(status_code=502, detail=detail)
 
-    selected, timezone_name = resolve_requested_date(config, module_config, "today")
+    _, timezone_name = resolve_requested_date(config, module_config, "today")
     try:
         timezone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
@@ -306,15 +595,21 @@ async def discover_remote_files(
 
 def select_files(
     files: list[dict[str, Any]], requested_date: date, today: date, log_type: str,
-    selected_ids: list[str] | None,
+    selected_ids: list[str] | None, server: str,
 ) -> list[dict[str, Any]]:
+    """按日期/类型自动选择文件；若传入 file_ids 则只取属于本资产的交集。"""
     candidates = [item for item in files if item["is_log_candidate"] and matches_type(item["relative_path"], log_type)]
     by_id = {item["file_id"]: item for item in candidates if item["searchable"]}
     if selected_ids:
-        unknown = [file_id for file_id in selected_ids if file_id not in by_id]
-        if unknown:
-            raise HTTPException(status_code=400, detail=f"Unknown or non-searchable file_id(s): {', '.join(unknown)}. Call discover_log_files again.")
-        return [by_id[file_id] for file_id in dict.fromkeys(selected_ids)]
+        # file_id 内嵌 server，多资产批量查询时每个资产只匹配自己的 ID；
+        # 不匹配的 ID 忽略，交集为空才报错。
+        matched = [by_id[file_id] for file_id in dict.fromkeys(selected_ids) if file_id in by_id]
+        if not matched:
+            raise HTTPException(
+                status_code=400,
+                detail=f"None of the given file_ids belong to server '{server}' or are searchable. Call discover_log_files again.",
+            )
+        return matched
 
     selected_iso = requested_date.isoformat()
     chosen = []
@@ -323,16 +618,17 @@ def select_files(
             continue
         date_hint = item["date_hint"]
         if requested_date == today:
-            # Today's active logs are often undated (e.g. info.log/error.log).
+            # 当天的活动日志通常无日期后缀（如 info.log/error.log）。
             if date_hint is None or date_hint == selected_iso:
                 chosen.append(item)
         elif date_hint == selected_iso:
             chosen.append(item)
-    # Avoid an unbounded remote grep if a directory contains many matching log files.
+    # 防止目录内匹配文件过多导致远程 grep 无界扫描。
     return chosen[:MAX_FILES_PER_QUERY]
 
 
 def candidate_summary(files: list[dict[str, Any]], log_type: str, limit: int = 30) -> list[dict[str, Any]]:
+    """裁剪候选文件列表，仅保留展示所需字段。"""
     candidates = [item for item in files if item["is_log_candidate"] and matches_type(item["relative_path"], log_type)]
     return [{
         "file_id": item["file_id"],
@@ -350,9 +646,10 @@ def selection_payload(
     files: list[dict[str, Any]], selected_ids: list[str] | None, truncated_listing: bool,
     server: str, module: str,
 ) -> dict[str, Any]:
+    """组装单资产的选择结果载荷（选中文件 + 候选清单 + 时区等元信息）。"""
     selected_date, timezone_name = resolve_requested_date(config, module_config, day)
     today, _ = resolve_requested_date(config, module_config, "today")
-    chosen = select_files(files, selected_date, today, log_type, selected_ids)
+    chosen = select_files(files, selected_date, today, log_type, selected_ids, server)
     return {
         "server": server,
         "module": module,
@@ -366,10 +663,11 @@ def selection_payload(
     }
 
 
-async def read_tail_from_ssh(app: FastAPI, paths: list[str], lines: int) -> tuple[str, bool]:
+async def read_tail_from_ssh(app: FastAPI, server: str, paths: list[str], lines: int) -> tuple[str, bool]:
+    """远程 tail 多个文件并按字节截断；返回 (输出, 是否被截断)。"""
     quoted_paths = " ".join(shlex.quote(path) for path in paths)
     command = f"tail -n {int(lines)} -- {quoted_paths} | head -c {MAX_READ_BYTES}"
-    result = await run_remote(app, command, timeout=45)
+    result = await run_remote(app, server, command, timeout=45)
     if result.exit_status not in (0, None):
         detail = (result.stderr or "Remote tail command failed").strip()[:1500]
         raise HTTPException(status_code=502, detail=detail)
@@ -377,13 +675,14 @@ async def read_tail_from_ssh(app: FastAPI, paths: list[str], lines: int) -> tupl
     return output, len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES
 
 
-async def search_files_on_ssh(app: FastAPI, paths: list[str], keyword: str, max_results: int) -> tuple[str, bool]:
+async def search_files_on_ssh(app: FastAPI, server: str, paths: list[str], keyword: str, max_results: int) -> tuple[str, bool]:
+    """远程固定字符串搜索（grep -F），限行数与字节数；返回 (输出, 是否被截断)。"""
     quoted_paths = " ".join(shlex.quote(path) for path in paths)
     command = (
         f"grep -F -H -n -- {shlex.quote(keyword)} {quoted_paths} "
         f"| head -n {int(max_results)} | head -c {MAX_READ_BYTES}"
     )
-    result = await run_remote(app, command, timeout=60)
+    result = await run_remote(app, server, command, timeout=QUERY_TIMEOUT_SECONDS)
     if result.exit_status not in (0, None):
         detail = (result.stderr or "Remote grep command failed").strip()[:1500]
         raise HTTPException(status_code=502, detail=detail)
@@ -393,95 +692,162 @@ async def search_files_on_ssh(app: FastAPI, paths: list[str], keyword: str, max_
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """应用生命周期：建连接池、起心跳任务、按 auto_connect 预认证；退出时清理。"""
     config = load_config()
-    jump = config["jumpserver"]
     read_token()
-    print("Connecting to JumpServer. Enter credentials only in this PowerShell window.")
-    conn = await asyncssh.connect(
-        jump["host"],
-        port=int(jump.get("port", 2222)),
-        username=jump["username"],
-        client_factory=ConsoleMFA,
-        password_auth=True,
-        kbdint_auth=True,
-        client_keys=[],
-        agent_path=None,
-        keepalive_interval=30,
-        keepalive_count_max=3,
+    manager = ConnectionManager(config)
+    app.state.manager = manager
+    interval = int(config["jumpserver"].get("keepalive_interval_minutes", DEFAULT_KEEPALIVE_MINUTES))
+    heartbeat = asyncio.create_task(heartbeat_loop(manager, interval))
+    for server in config["jumpserver"].get("auto_connect") or []:
+        if server in manager.assets:
+            manager.request_connect(server)
+        else:
+            print(f"[warn] auto_connect: unknown server '{server}' ignored.")
+    print(
+        "Gateway ready. Authenticate assets via the reconnect_asset MCP tool (or POST /connect); "
+        "password/MFA prompts appear in this terminal."
     )
-    app.state.ssh_conn = conn
-    app.state.ssh_lock = asyncio.Lock()
-    print("SSH authentication succeeded. The connection will be reused until it closes.")
     try:
         yield
     finally:
-        conn.close()
-        await conn.wait_closed()
+        heartbeat.cancel()
+        await manager.close_all()
 
 
-app = FastAPI(title="Local Directory-discovery Log Gateway", lifespan=lifespan)
+app = FastAPI(title="Local Multi-asset Directory-discovery Log Gateway", lifespan=lifespan)
 
 
 @app.get("/health")
-async def health(_: None = Depends(check_bearer)) -> dict[str, Any]:
-    conn: asyncssh.SSHClientConnection | None = getattr(app.state, "ssh_conn", None)
-    return {"ssh_connected": bool(conn and not conn.is_closed())}
+async def health(_config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """健康检查：资产总数、已连接数、已连接资产名。"""
+    manager: ConnectionManager = app.state.manager
+    connected = manager.connected_assets()
+    return {
+        "assets_total": len(manager.assets),
+        "assets_connected": len(connected),
+        "connected_servers": [asset.server for asset in connected],
+    }
 
 
 @app.get("/targets")
-async def targets(_: None = Depends(check_bearer)) -> dict[str, Any]:
-    config = load_config()
-    active = config["jumpserver"]["active_target"]
-    target = config["targets"].get(active, {})
+async def targets(config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """列出全部资产、模块（含业务描述）、日志目录与连接状态。"""
+    manager: ConnectionManager = app.state.manager
+    statuses = {item["server"]: item for item in manager.statuses()}
     return {
-        "active_target": active,
-        "description": target.get("description", ""),
-        "modules": {name: {"log_dir": cfg.get("log_dir", "")} for name, cfg in (target.get("modules") or {}).items()},
+        "targets": {
+            name: {
+                "description": target.get("description", ""),
+                "modules": {
+                    module: {"log_dir": cfg.get("log_dir", ""), "description": cfg.get("description", "")}
+                    for module, cfg in (target.get("modules") or {}).items()
+                },
+                "connection": statuses.get(name),
+            }
+            for name, target in config["targets"].items()
+        },
         "log_timezone": config.get("log_timezone", "UTC"),
         "supported_day_values": ["today", "yesterday", "YYYY-MM-DD"],
     }
 
 
+@app.get("/connections")
+async def connections(_config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """列出各资产的连接状态、上次心跳时间与断开原因。"""
+    manager: ConnectionManager = app.state.manager
+    return {"connections": manager.statuses()}
+
+
+@app.post("/connect")
+async def connect(request: ConnectRequest, _config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """触发指定资产的后台重连认证（MFA 在 gateway 终端完成）。"""
+    manager: ConnectionManager = app.state.manager
+    return manager.request_connect(request.server)
+
+
 @app.post("/discover-logs")
-async def discover_logs(request: DiscoverRequest, http_request: Request, _: None = Depends(check_bearer)) -> dict[str, Any]:
-    config = load_config()
-    log_dir, module_config, files, truncated = await discover_remote_files(http_request.app, config, request.server, request.module)
-    payload = selection_payload(config, module_config, request.day, request.log_type, files, None, truncated, request.server, request.module)
-    # Includes all discovered candidate IDs so the model can select a nonstandard filename safely.
-    payload["candidate_files"] = candidate_summary(files, request.log_type, request.max_files)
-    payload["log_dir"] = log_dir
-    payload["auto_selected_files"] = [
-        {key: item[key] for key in ("file_id", "relative_path", "size_bytes", "mtime_local", "date_hint", "kind_hint", "searchable")}
-        for item in payload.pop("selected_files")
-    ]
-    payload["note"] = "Only file_ids discovered under the configured log_dir may be passed to read/search. Compressed files are listed but not searchable in this starter."
-    return payload
+async def discover_logs(request: DiscoverRequest, http_request: Request, config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """多资产动态发现日志文件；返回全部候选的 file_id 供后续精确查询。"""
+
+    async def handler(server: str) -> dict[str, Any]:
+        log_dir, module_config, files, truncated = await discover_remote_files(http_request.app, config, server, request.module)
+        payload = selection_payload(config, module_config, request.day, request.log_type, files, None, truncated, server, request.module)
+        payload["candidate_files"] = candidate_summary(files, request.log_type, request.max_files)
+        payload["log_dir"] = log_dir
+        payload["auto_selected_files"] = [
+            {key: item[key] for key in ("file_id", "relative_path", "size_bytes", "mtime_local", "date_hint", "kind_hint", "searchable")}
+            for item in payload.pop("selected_files")
+        ]
+        payload["note"] = (
+            "Only file_ids discovered under the configured log_dir may be passed to read/search. "
+            "Compressed files are not searchable with search/read-tail; use execute_query with zgrep/zcat for them."
+        )
+        return payload
+
+    return {"results": await fan_out(unique_servers(request.servers), handler)}
 
 
 @app.post("/read-tail")
-async def read_tail(request: ReadRequest, http_request: Request, _: None = Depends(check_bearer)) -> dict[str, Any]:
-    config = load_config()
-    log_dir, module_config, files, truncated_listing = await discover_remote_files(http_request.app, config, request.server, request.module)
-    payload = selection_payload(config, module_config, request.day, request.log_type, files, request.file_ids, truncated_listing, request.server, request.module)
-    chosen = payload["selected_files"]
-    if not chosen:
-        return {"found": False, **{k: v for k, v in payload.items() if k != "selected_files"}, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
-    paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
-    text, truncated = await read_tail_from_ssh(http_request.app, paths, request.lines)
-    return {"found": True, **{k: v for k, v in payload.items() if k != "selected_files"}, "files_read": chosen, "lines_requested_per_file": request.lines, "text": text, "possibly_truncated_by_bytes": truncated}
+async def read_tail(request: ReadRequest, http_request: Request, config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """多资产读取日志末尾；文件按日期/类型自动选择或用 file_ids 指定。"""
+
+    async def handler(server: str) -> dict[str, Any]:
+        log_dir, module_config, files, truncated_listing = await discover_remote_files(http_request.app, config, server, request.module)
+        payload = selection_payload(config, module_config, request.day, request.log_type, files, request.file_ids, truncated_listing, server, request.module)
+        chosen = payload.pop("selected_files")
+        if not chosen:
+            return {"found": False, **payload, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
+        paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
+        text, truncated = await read_tail_from_ssh(http_request.app, server, paths, request.lines)
+        return {"found": True, **payload, "files_read": chosen, "lines_requested_per_file": request.lines, "text": text, "possibly_truncated_by_bytes": truncated}
+
+    return {"results": await fan_out(unique_servers(request.servers), handler)}
 
 
 @app.post("/search-logs")
-async def search_logs(request: SearchRequest, http_request: Request, _: None = Depends(check_bearer)) -> dict[str, Any]:
-    config = load_config()
-    log_dir, module_config, files, truncated_listing = await discover_remote_files(http_request.app, config, request.server, request.module)
-    payload = selection_payload(config, module_config, request.day, request.log_type, files, request.file_ids, truncated_listing, request.server, request.module)
-    chosen = payload["selected_files"]
-    if not chosen:
-        return {"found": False, **{k: v for k, v in payload.items() if k != "selected_files"}, "keyword": request.keyword, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
-    paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
-    text, truncated = await search_files_on_ssh(http_request.app, paths, request.keyword, request.max_results)
-    return {"found": True, **{k: v for k, v in payload.items() if k != "selected_files"}, "keyword": request.keyword, "files_searched": chosen, "matches_text": text, "possibly_truncated_by_bytes": truncated}
+async def search_logs(request: SearchRequest, http_request: Request, config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """多资产固定字符串搜索（grep -F）；文件按日期/类型自动选择或用 file_ids 指定。"""
+
+    async def handler(server: str) -> dict[str, Any]:
+        log_dir, module_config, files, truncated_listing = await discover_remote_files(http_request.app, config, server, request.module)
+        payload = selection_payload(config, module_config, request.day, request.log_type, files, request.file_ids, truncated_listing, server, request.module)
+        chosen = payload.pop("selected_files")
+        if not chosen:
+            return {"found": False, **payload, "keyword": request.keyword, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
+        paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
+        text, truncated = await search_files_on_ssh(http_request.app, server, paths, request.keyword, request.max_results)
+        return {"found": True, **payload, "keyword": request.keyword, "files_searched": chosen, "matches_text": text, "possibly_truncated_by_bytes": truncated}
+
+    return {"results": await fan_out(unique_servers(request.servers), handler)}
+
+
+@app.post("/execute-query")
+async def execute_query(request: ExecuteQueryRequest, http_request: Request, config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """多资产受限自由只读查询：静态校验通过后以 cwd=log_dir 执行命令。"""
+
+    async def handler(server: str) -> dict[str, Any]:
+        _, module_config = resolve_target_module(config, server, request.module)
+        log_dir = normalize_log_dir(module_config, request.module)
+        try:
+            validate_query_command(request.command, log_dir)
+        except CommandValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 工作目录锁定在授权 log_dir；输出由服务端按字节截断。
+        wrapped = f"cd {shlex.quote(log_dir)} && {request.command} | head -c {MAX_READ_BYTES}"
+        result = await run_remote(http_request.app, server, wrapped, timeout=QUERY_TIMEOUT_SECONDS)
+        output = result.stdout or ""
+        return {
+            "module": request.module,
+            "log_dir": log_dir,
+            "executed_command": request.command,
+            "exit_code": result.exit_status,
+            "stdout": output,
+            "stderr": (result.stderr or "").strip()[:500],
+            "possibly_truncated_by_bytes": len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES,
+        }
+
+    return {"results": await fan_out(unique_servers(request.servers), handler)}
 
 
 if __name__ == "__main__":
