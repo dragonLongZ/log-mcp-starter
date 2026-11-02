@@ -52,7 +52,8 @@ targets:
 | `discover_log_files(servers, module, day, log_type, max_files)` | 动态发现候选日志文件，返回不透明 `file_id` |
 | `search_logs(servers, module, keyword, day, log_type, max_results, file_ids)` | 固定字符串搜索（grep -F），支持多资产 |
 | `read_log_tail(servers, module, day, log_type, lines, file_ids)` | 读取文件末尾，支持多资产 |
-| `execute_query(servers, module, command)` | 受限自由只读查询（白名单命令 + 管道） |
+| `execute_query(servers, module, command)` | 受限自由只读查询（白名单命令 + 管道，限定 log_dir） |
+| `execute_system_query(servers, command)` | 系统/Docker/K8s 只读查看（三段式分类，不限定目录） |
 
 `servers` 接受 1–10 个资产名，结果按资产分组，单资产失败不阻断其他资产。`day` 支持 `today`、`yesterday` 或 `YYYY-MM-DD`；`log_type` 支持 `info`、`error`、`both`。
 
@@ -61,12 +62,20 @@ targets:
 命令在下发 SSH 前经过默认拒绝的静态校验（`command_guard.py`）：
 
 - **白名单命令**：grep、egrep、fgrep、zgrep、head、tail、cat、zcat、wc、sort、uniq、awk、sed、cut、tr、tac、ls、find、du、file；管道 `|` 最多 5 段。
-- **字符级拒绝**：`;`、`&&`、`||`、反引号、`$(`、`>`、`<`、换行（因此 awk 中 `>` 比较不可用）。
-- **逐命令规则**：sed 禁 `-i` 与 `w`/`W`/`e` 命令；awk 禁 `system()`/`getline`/`-f`；find 禁 `-exec`/`-delete`；sort 禁 `-o`；uniq 最多一个文件参数。
+- **拒绝**：`;`、`&&`、`||`、反引号、`$(`、换行；输出重定向 `>`/`>>`；路径中的 `$变量`/`~`（shell 展开会绕过路径检查）。awk 内部的 `>` 比较允许。
+- **逐命令规则**：sed 禁 `-i` 与 `w`/`W`/`e` 命令；awk 禁 `system()`/`getline`/`print >`/−f；find 禁 `-delete`，`-exec` 允许但嵌套命令须在白名单内；sort 禁 `-o`；uniq 最多一个文件参数。
 - **路径限定**：相对路径以 `log_dir` 为基准（服务端强制 `cd log_dir`），绝对路径必须位于 `log_dir` 内，`..` 一律拒绝；含 `/` 的搜索词用 `grep -e 'PATTERN'`。
-- **资源上限**：输出 100KB 截断、超时 60s、单次最多 50 个文件参数。
+- **资源上限**：输出 100KB 截断、超时 60s、单次最多 50 个文件参数。远程命令用 `bash -c 'set -o pipefail; … | head -c'` 执行，失败不会被截断管道掩盖（`141` 视为截断）。
 
-校验规则可用 `uv run pytest test_command_guard.py` 回归。
+校验规则可用 `uv run pytest test/` 回归；端到端覆盖测试为 `uv run python test/e2e_check.py`（需要 gateway 与资产认证）。
+
+## execute_system_query 安全模型
+
+`system_guard.py` 三段式分类：安全命令自动执行、危险命令自动拦截、未知命令返回 UNKNOWN 让用户确认。
+
+- **白名单**：OS 查看（ps、df、free、top -b、journalctl 等）、Docker 只读子命令、kubectl 只读子命令。
+- **黑名单**：rm/mv/cp/dd、sudo/su、reboot/shutdown、chmod/chown、curl/wget/nc/ssh、bash/python、systemctl start/stop、docker rm/exec/run、kubectl delete/apply/exec 等。
+- **额外限制**：grep/head/tail/awk 等只能接在 `|` 之后（不能单独读文件）；`top` 必须带 `-b`；`journalctl` 禁 `-f`；`kubectl get/describe secret(s)` 与 `kubectl config view --raw` 被拒绝（防凭据泄露）；禁止输出重定向、命令串联与 `$(`。
 
 ## 配套 Skill
 

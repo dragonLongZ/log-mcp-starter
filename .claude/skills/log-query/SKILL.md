@@ -41,8 +41,12 @@ description: 通过 JumpServer 日志 MCP 查询远程服务器日志（多资�
 
 - 对**选定资产集合中的每一台**检查状态（来自第 1 步 list_log_targets 的连接状态，或调用 `list_connections`）：
   - `connected` → 就绪。
-  - `disconnected` / `needs_reauth` → 对**该选定资产**调用 `reconnect_asset(server)`，然后**告知用户到 gateway_host.py 终端完成密码/MFA**，等用户确认后重试。
-  - `connecting` → 提示用户去 gateway 终端完成认证，**不要重复调用**，等待后重试。
+  - `disconnected` / `needs_reauth` → 对**该选定资产**调用 `reconnect_asset(server)`，然后**告知用户到 gateway_host.py 终端完成密码/MFA**，并进入下方轮询。
+  - `connecting` → 提示用户去 gateway 终端完成认证，**不要重复调用**，直接进入下方轮询。
+- **认证轮询（代替干等用户通知）**：告知用户后，每隔约 5 秒调用一次 `list_connections` 查询**选定资产**状态，最多轮询约 2 分钟（约 24 次）。
+  - 期间变为 `connected` → 立即停止轮询，继续执行原查询，无需等用户回复。
+  - 时间到仍未 `connected` → 停止轮询，回复用户"认证尚未完成；完成后告诉我，我再继续查询"，**不要无限轮询**，也不要反复调用 `reconnect_asset`。
+  - 轮询只覆盖选定资产；其他资产的状态变化与本次任务无关，不查询、不提示。
 - **禁止**对选定集合之外的资产调用 `reconnect_asset`，即使它们也处于断连状态。
 - 若任何工具返回 "Local SSH bridge is not running"：提示用户在独立终端运行 `uv run python gateway_host.py`，**不要盲目重试**。
 - 同一错误（断连/认证）**最多引导一次**，用户未确认完成前不重复发起相同查询。
@@ -67,15 +71,27 @@ description: 通过 JumpServer 日志 MCP 查询远程服务器日志（多资�
 | 看某时间段上下文（匹配行前后 N 行） | `execute_query` | `grep -A 20 -B 5 'KEYWORD' file` |
 | 文件名/日期不确定、自动选择失败 | `discover_log_files` | 先列候选，再用返回的 `file_ids` 传给 search/read |
 | 多命令组合排查 | `execute_query` | 管道最多 5 段 |
+| 看系统资源/磁盘/进程 | `execute_system_query` | `df -h`、`free -m`、`ps aux`、`top -bn1` |
+| 查 Docker 容器/日志 | `execute_system_query` | `docker ps`、`docker logs xxx`，可接 `\| head -n 20` |
+| 查 K8s 资源/日志 | `execute_system_query` | `kubectl get pods`、`kubectl logs xxx` |
 
 **execute_query 使用要点**（避免被校验器拒绝）：
 
 - 命令在模块 `log_dir` 下执行，**优先用相对路径**（如 `info.log`、`archive/x.log`）。
 - 含 `/` 的搜索词必须写成 `grep -e '/api/v1'`，否则会被当作路径校验而拒绝。
-- 禁止出现 `;` `&&` `||` 反引号 `$(` `>` `<`；awk 里不能用 `>` 比较（改用 `match()`、`length()`、`==` 或先 grep 过滤）。
-- sed 不能 `-i`；awk 不能 `system()`/`getline`；find 不能 `-exec`/`-delete`；sort 不能 `-o`。
+- 禁止命令串联 `;` `&&` `||` 与换行；禁止反引号、`$(`、以及路径里的 `$变量`/`~`（shell 展开会绕过路径检查）。
+- 禁止输出重定向 `>` `>>`；但 awk 内部的 `>` 比较是允许的（如 `awk '$3 > 10'`）。
+- sed 不能 `-i`；awk 不能 `system()`/`getline`/`print > file`；find 不能 `-delete`，`-exec` 允许但嵌套命令必须在白名单内；sort 不能 `-o`。
 - grep 退出码 1 = 无匹配，不是错误，如实向用户报告"未找到"。
 - 输出上限 100KB、超时 60s；结果被截断时告知用户缩小范围。
+
+**execute_system_query 使用要点**：
+
+- 不需要传 `module`；`servers` 仍只传选定资产集合。
+- 文本处理命令（grep/head/tail/awk 等）只能接在管道后面，不能单独作为第一条命令读文件；读日志文件请用 `execute_query`。
+- `top` 必须加 `-b`（如 `top -bn1`）；`journalctl` 不能加 `-f`。
+- 白名单/黑名单/未知三段：返回 UNKNOWN 时不要自行改写重试，先告知用户该命令未知、需要人工确认。
+- 典型：`docker ps | head -20`、`df -h`、`kubectl get pods -A`、`systemctl status nginx`。
 
 ### 第 5 步：多资产结果汇总格式
 
@@ -112,9 +128,11 @@ description: 通过 JumpServer 日志 MCP 查询远程服务器日志（多资�
 | 错误信息 | 处理 |
 |---|---|
 | `Local SSH bridge is not running` | 引导用户启动 gateway_host.py |
-| `Asset 'x' is not connected` / `needs_reauth` | 仅当 x 属于选定资产时：reconnect_asset + 引导用户到 gateway 终端 MFA |
-| `Authentication in progress` | 让用户完成 gateway 终端认证后重试，不重复调用 |
+| `Asset 'x' is not connected` / `needs_reauth` | 仅当 x 属于选定资产时：reconnect_asset + 引导用户到 gateway 终端 MFA，然后每 ~5s 轮询 list_connections，最多 ~2 分钟 |
+| `Authentication in progress` | 引导用户完成 gateway 终端认证，进入同样的 5s/2min 有界轮询；不重复调用 reconnect_asset |
 | `Unknown module 'x' for server 'y'` | 重新 list_log_targets 核对模块名，或让用户确认 |
 | `None of the given file_ids belong to server` | 重新 discover_log_files 获取该资产的 file_ids |
 | `... is not in the read-only whitelist` | 换用白名单命令重写查询，或改用 search_logs |
 | `Path ... is outside the authorized log directory` | 改用相对路径；含 `/` 的搜索词改用 `grep -e` |
+| `UNKNOWN: ...`（系统工具） | 命令不在已知安全/危险名单：告知用户需人工确认，不要改写后反复尝试 |
+| `REJECTED: ...`（系统工具） | 命中危险命令或安全限制：如实说明被拒原因，不绕过 |
