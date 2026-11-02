@@ -81,10 +81,12 @@ def format_log_payload(result: dict[str, Any]) -> str:
         return header + result.get("message", "No files automatically matched.") + "\nCandidates:\n" + format_files(result.get("candidate_files", []))
     files = result.get("files_searched", result.get("files_read", []))
     body = result.get("matches_text", result.get("text", ""))
+    stderr = result.get("stderr") or ""
     return (
         header + "Files selected:\n" + format_files(files) + "\n"
         f"Directory listing truncated: {result.get('truncated_listing')}\n"
         f"Output may be byte-truncated: {result.get('possibly_truncated_by_bytes')}\n"
+        + (f"Stderr: {stderr}\n" if stderr else "")
         + ("--- RESULTS ---\n" + (body or "(no matches found)"))
     )
 
@@ -111,6 +113,20 @@ def format_query_payload(result: dict[str, Any]) -> str:
         f"Module: {result['module']} | Directory: {result['log_dir']}",
         f"Command: {result['executed_command']}",
         f"Exit code: {result['exit_code']} (for grep, exit 1 means no match, not an error)",
+        f"Output byte-truncated: {result['possibly_truncated_by_bytes']}",
+    ]
+    if result.get("stderr"):
+        lines.append(f"Stderr: {result['stderr']}")
+    lines.append("--- OUTPUT ---")
+    lines.append(result.get("stdout") or "(no output)")
+    return "\n".join(lines)
+
+
+def format_system_query_payload(result: dict[str, Any]) -> str:
+    """格式化 execute_system_query 的单资产结果。"""
+    lines = [
+        f"Command: {result['executed_command']}",
+        f"Exit code: {result['exit_code']}",
         f"Output byte-truncated: {result['possibly_truncated_by_bytes']}",
     ]
     if result.get("stderr"):
@@ -267,16 +283,18 @@ async def execute_query(
     module: str,
     command: str,
 ) -> str:
-    """在一个或多个资产的模块日志目录下执行只读 shell 管道命令。只读：任何写入/修改/删除尝试都会在执行前被拒绝。
+    r"""在一个或多个资产的模块日志目录下执行只读 shell 管道命令。只读：任何写入/修改/删除尝试都会在执行前被拒绝。
 
 gateway 强制的规则：
 - 仅允许白名单命令：grep、egrep、fgrep、zgrep、head、tail、cat、zcat、wc、sort、uniq、awk、sed、cut、tr、tac、ls、find、du、file。允许管道 '|'（最多 5 段）。
-- 任何位置禁止出现：; && || 反引号 $( > < 以及换行。因此 awk 中含 '>' 的比较也不可用。
-- 路径：相对路径在模块 log_dir 内解析（推荐）；绝对路径必须位于 log_dir 内；拒绝 '..'。含 '/' 的搜索词必须写成 grep -e 'PATTERN'。
-- sed 禁止 -i 与 w/W/e 命令；awk 禁止 system()/getline；find 禁止 -exec/-delete；sort 禁止 -o；uniq 最多一个文件参数。
+- 禁止命令串联：; && || 与换行。
+- 禁止命令替换与 shell 展开：反引号、$(、$变量、~ 不能出现在路径里（含 '/' 的搜索词用 grep -e 'PATTERN'）。
+- 禁止输出重定向（> >>）；单个 '>' 只在 awk 内作为比较是允许的（如 awk '$3 > 10'）。
+- 路径：相对路径在模块 log_dir 内解析（推荐）；绝对路径必须位于 log_dir 内；拒绝 '..'。
+- sed 禁止 -i 与 w/W/e 命令；awk 禁止 system()/getline/print >；find 禁止 -delete，-exec/-execdir 允许但被执行的命令必须在白名单内；sort 禁止 -o；uniq 最多一个文件参数。
 - 输出 100KB 截断；超时 60 秒。grep 退出码 1 表示"无匹配"，不是错误。
 
-示例：grep -E 'ERROR.*timeout' info.log | tail -n 50 ；zgrep 'OutOfMemory' info.log.2026-10-27.gz ；tail -n 200 error.log | grep -e '/api/v1' ；cat info.log | grep ERROR | sort | uniq -c | head -20"""
+示例：grep -E 'ERROR.*timeout' info.log | tail -n 50 ；zgrep 'OutOfMemory' info.log.2026-10-27.gz ；tail -n 200 error.log | grep -e '/api/v1' ；cat info.log | grep ERROR | sort | uniq -c | head -20 ；find . -name '*.log' -exec grep -l ERROR {} \;"""
     invalid = check_servers(servers)
     if invalid:
         return invalid
@@ -289,6 +307,57 @@ gateway 强制的规则：
         return format_grouped(result.get("results", []), format_query_payload)
     except Exception as exc:
         return f"Query execution failed: {exc}"
+
+
+@mcp.tool()
+async def execute_system_query(
+    servers: list[str],
+    command: str,
+) -> str:
+    """在一个或多个资产的远程默认工作目录下执行系统/Docker/K8s 只读查看命令。不锁定 log_dir。
+
+三段式命令分类（gateway 强制的规则）：
+1) 白名单 — 直接执行：
+   - OS 查看：ps, top (必须加 -b，如 top -bn1), df, free, uptime, uname, who, w, last, id, pwd, date (禁-s), netstat, ss, nslookup, dig, ip addr/link/route/neigh, iostat, vmstat, lscpu, lsblk, dmesg, lsof, lspci, lsusb, pidof, pgrep
+   - systemd 只读：systemctl status/list-units/is-active/is-enabled, journalctl (禁 -f/--follow)
+   - Docker 只读：docker ps/images/logs/inspect/stats/info/version, docker container/network/volume ls|inspect|logs
+   - K8s 只读：kubectl get/describe/logs/top/api-resources/api-versions/cluster-info/config view/explain
+     例外：kubectl get/describe 涉及 secret(s)、kubectl config view --raw 会被拒绝（会泄露凭据）
+   - 管道辅助命令：grep, head, tail, wc, sort, uniq, cut, tr, awk (禁 -f)
+     这些命令只能接在管道后面（如 docker ps | grep nginx），不能单独作为第一条命令读文件；读文件请用 execute_query
+2) 黑名单 — 自动拦截（绝不执行）：
+   - 破坏：rm, mv, cp, dd, mkfs
+   - 提权：sudo, su, pkexec
+   - 关停：reboot, shutdown, halt, kill, pkill
+   - 权限：chmod, chown
+   - 外发：curl, wget, nc, ssh, scp, telnet
+   - 执行：bash, sh, python, eval, exec
+   - systemctl start/stop/restart/enable/disable
+   - docker rm/stop/kill/exec/run/build/push
+   - kubectl delete/apply/create/edit/patch/scale/exec
+3) 未知 — 不在上述两个名单中的命令：gateway 拒绝执行，返回 UNKNOWN 状态和命令名。此时必须告知用户该命令被识别为未知，让用户来决定是否运行。不要在收到 UNKNOWN 后自行绕过或继续尝试。
+
+安全限制（对所有命令生效）：
+- 禁止输出重定向（> / >> / &>）
+- 禁止命令串联符（; && ||）与换行
+- 禁止命令替换（$( / 反引号）
+- 禁止 awk 的 system()/getline/print > 内部写原语
+- 输出 100KB 截断，超时 60 秒
+- 管道最多 3 段
+
+常见用法：docker ps | head -20 ；df -h ；kubectl get pods -A ；systemctl status nginx ；ps aux | grep java | head -5"""
+    invalid = check_servers(servers)
+    if invalid:
+        return invalid
+    if not command or not command.strip() or len(command) > 2000:
+        return "Invalid command: provide 1-2000 characters."
+    try:
+        result = await bridge_request("POST", "/execute-system-query", {
+            "servers": servers, "command": command,
+        })
+        return format_grouped(result.get("results", []), format_system_query_payload)
+    except Exception as exc:
+        return f"System query execution failed: {exc}"
 
 
 if __name__ == "__main__":

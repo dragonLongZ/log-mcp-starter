@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from command_guard import CommandValidationError, validate_query_command
+from system_guard import Verdict, ValidationResult, validate_system_info_command
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
@@ -38,6 +39,7 @@ MAX_DEPTH = 5
 MAX_SERVERS_PER_QUERY = 10
 DEFAULT_KEEPALIVE_MINUTES = 25
 QUERY_TIMEOUT_SECONDS = 60
+CONNECTION_TEST_TIMEOUT_SECONDS = 5
 
 AssetState = Literal["disconnected", "connecting", "connected", "needs_reauth"]
 
@@ -90,6 +92,10 @@ class ConsoleMFA(asyncssh.SSHClient):
     def __init__(self, server: str) -> None:
         self._server = server
         self._password: str | None = None
+
+    def set_password(self, password: str) -> None:
+        """复用 connect() 里已经通过线程读取的密码，避免事件循环里再阻塞一次。"""
+        self._password = password
 
     def password_auth_requested(self) -> str:
         if self._password is None:
@@ -157,10 +163,16 @@ class AssetConnection:
         """在后台任务中执行；密码/MFA 提示出现在 gateway 终端。"""
         try:
             print(f"[{self.server}] Connecting to JumpServer; complete password/MFA in this terminal.")
+            # 密码在独立线程读取，避免 getpass 阻塞事件循环（轮询/心跳还能响应）。
+            password = await asyncio.to_thread(
+                getpass.getpass, f"[{self.server}] JumpServer password: "
+            )
+            self._mfa.set_password(password)
             conn = await asyncssh.connect(
                 self.host,
                 port=self.port,
                 username=self.ssh_username,
+                password=password,
                 client_factory=lambda: self._mfa,
                 password_auth=True,
                 kbdint_auth=True,
@@ -170,6 +182,10 @@ class AssetConnection:
                 keepalive_interval=30,
                 keepalive_count_max=3,
             )
+        except (EOFError, KeyboardInterrupt):
+            self.state = "disconnected"
+            self.disconnect_reason = "authentication cancelled"
+            return
         except asyncio.CancelledError:
             self.state = "disconnected"
             raise
@@ -182,8 +198,15 @@ class AssetConnection:
         self.state = "connected"
         self.disconnect_reason = None
         self.last_heartbeat = None
-        conn.add_disconnect_handler(lambda _conn: self.mark_disconnected("SSH connection closed by remote or network"))
+        asyncio.create_task(self._watch_disconnect())
         print(f"[{self.server}] SSH authentication succeeded; the connection is kept alive by heartbeat.")
+
+    async def _watch_disconnect(self) -> None:
+        """后台任务：连接断开时自动标记为 needs_reauth。"""
+        if self.conn is None:
+            return
+        await self.conn.wait_closed()
+        self.mark_disconnected("SSH connection closed by remote or network")
 
 
 class ConnectionManager:
@@ -294,7 +317,15 @@ class ConnectionManager:
 
     async def _connect_guarded(self, asset: AssetConnection) -> None:
         async with self._auth_semaphore:
-            await asset.connect()
+            try:
+                await asset.connect()
+            except Exception as exc:
+                if asset.state == "connecting":
+                    asset.state = "needs_reauth"
+                    asset.disconnect_reason = f"connect failed: {type(exc).__name__}: {exc}"[:300]
+                    print(f"[{asset.server}] Connection failed: {asset.disconnect_reason}")
+                else:
+                    raise
 
     def connected_assets(self) -> list[AssetConnection]:
         return [asset for asset in self._assets.values() if asset.is_live()]
@@ -368,6 +399,11 @@ class ExecuteQueryRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
 
 
+class SystemQueryRequest(BaseModel):
+    servers: list[str] = Field(min_length=1, max_length=MAX_SERVERS_PER_QUERY)
+    command: str = Field(min_length=1, max_length=2000)
+
+
 class ConnectRequest(BaseModel):
     server: str = Field(min_length=1, max_length=100)
 
@@ -409,6 +445,8 @@ async def fan_out(
             return {"server": server, **payload}
         except HTTPException as exc:
             return {"server": server, "error": f"HTTP {exc.status_code}: {exc.detail}"}
+        except Exception as exc:  # 单资产失败不应中断其他资产
+            return {"server": server, "error": f"{type(exc).__name__}: {exc}"}
 
     return list(await asyncio.gather(*(one(server) for server in servers)))
 
@@ -513,6 +551,19 @@ def file_id_for(server: str, module: str, relative_path: str) -> str:
     return hashlib.sha256(f"{server}\0{module}\0{relative_path}".encode("utf-8")).hexdigest()[:16]
 
 
+async def probe_connection(asset: AssetConnection) -> None:
+    """主动执行 `true` 验证会话真实可用；失败抛异常由调用方处理。
+
+    `conn.is_closed()` 无法及时感知服务端断连或半开连接，
+    会出现"状态 connected、命令 exit 0 但输出为空"的假象。
+    在下发真实命令前探测，可将此类故障提前暴露为明确的 409 重连提示。
+    """
+    assert asset.conn is not None
+    result = await asset.conn.run("true", check=False, timeout=CONNECTION_TEST_TIMEOUT_SECONDS)
+    if result.exit_status != 0:
+        raise OSError(f"probe returned exit status {result.exit_status}")
+
+
 async def run_remote(app: FastAPI, server: str, command: str, timeout: int = 30) -> asyncssh.SSHCompletedProcess[str]:
     """在指定资产的 SSH 会话上执行命令（持该资产的锁，串行化）。"""
     manager: ConnectionManager = app.state.manager
@@ -525,10 +576,31 @@ async def run_remote(app: FastAPI, server: str, command: str, timeout: int = 30)
                     status_code=409,
                     detail=f"Asset '{server}' connection closed. Call reconnect_asset('{server}') and complete MFA in the gateway terminal.",
                 )
+            try:
+                await probe_connection(asset)
+            except (asyncssh.Error, asyncio.TimeoutError, OSError) as exc:
+                asset.mark_disconnected(f"connection probe failed: {type(exc).__name__}: {exc}")
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Connection probe failed on '{server}' ({type(exc).__name__}). Call "
+                        f"reconnect_asset('{server}') and complete password/MFA in the gateway terminal."
+                    ),
+                ) from exc
             return await asset.conn.run(command, check=False, timeout=timeout)
     except (asyncssh.Error, asyncio.TimeoutError) as exc:
         asset.mark_disconnected(f"remote operation failed: {type(exc).__name__}")
         raise HTTPException(status_code=502, detail=f"Remote log operation failed on '{server}': {type(exc).__name__}") from exc
+
+
+async def run_remote_piped(app: FastAPI, server: str, command: str, timeout: int = 30) -> asyncssh.SSHCompletedProcess[str]:
+    """执行命令并把输出截断到 MAX_READ_BYTES。
+
+    pipefail 让退出码反映命令本身（而不是 head）。输出超限时 head 提前关闭管道，
+    上游收到 SIGPIPE（141）属于预期的截断，调用方需把 141 当作成功。
+    """
+    inner = f"set -o pipefail; {command} | head -c {MAX_READ_BYTES}"
+    return await run_remote(app, server, "bash -c " + shlex.quote(inner), timeout=timeout)
 
 
 async def discover_remote_files(
@@ -543,8 +615,9 @@ async def discover_remote_files(
         "-printf '%p\\t%s\\t%T@\\n' 2>/dev/null "
         f"| head -n {MAX_DISCOVERY_FILES}"
     )
-    result = await run_remote(app, server, command, timeout=30)
-    if result.exit_status not in (0, None):
+    result = await run_remote_piped(app, server, command, timeout=30)
+    # find 权限不足会返回 1 但仍输出部分结果；141 = 输出被 head 截断。
+    if result.exit_status not in (0, 1, None, 141):
         detail = (result.stderr or "Unable to list the configured log directory").strip()[:1000]
         raise HTTPException(status_code=502, detail=detail)
 
@@ -663,31 +736,32 @@ def selection_payload(
     }
 
 
-async def read_tail_from_ssh(app: FastAPI, server: str, paths: list[str], lines: int) -> tuple[str, bool]:
-    """远程 tail 多个文件并按字节截断；返回 (输出, 是否被截断)。"""
+async def read_tail_from_ssh(app: FastAPI, server: str, paths: list[str], lines: int) -> tuple[str, bool, str]:
+    """远程 tail 多个文件并按字节截断；返回 (输出, 是否被截断, stderr)。"""
     quoted_paths = " ".join(shlex.quote(path) for path in paths)
-    command = f"tail -n {int(lines)} -- {quoted_paths} | head -c {MAX_READ_BYTES}"
-    result = await run_remote(app, server, command, timeout=45)
-    if result.exit_status not in (0, None):
+    command = f"tail -n {int(lines)} -- {quoted_paths}"
+    result = await run_remote_piped(app, server, command, timeout=45)
+    if result.exit_status not in (0, None, 141):  # 141 = 输出被 head 截断
         detail = (result.stderr or "Remote tail command failed").strip()[:1500]
         raise HTTPException(status_code=502, detail=detail)
     output = result.stdout or ""
-    return output, len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES
+    return output, len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES, (result.stderr or "").strip()[:1000]
 
 
-async def search_files_on_ssh(app: FastAPI, server: str, paths: list[str], keyword: str, max_results: int) -> tuple[str, bool]:
-    """远程固定字符串搜索（grep -F），限行数与字节数；返回 (输出, 是否被截断)。"""
+async def search_files_on_ssh(app: FastAPI, server: str, paths: list[str], keyword: str, max_results: int) -> tuple[str, bool, str]:
+    """远程固定字符串搜索（grep -F），限行数与字节数；返回 (输出, 是否被截断, stderr)。"""
     quoted_paths = " ".join(shlex.quote(path) for path in paths)
     command = (
         f"grep -F -H -n -- {shlex.quote(keyword)} {quoted_paths} "
-        f"| head -n {int(max_results)} | head -c {MAX_READ_BYTES}"
+        f"| head -n {int(max_results)}"
     )
-    result = await run_remote(app, server, command, timeout=QUERY_TIMEOUT_SECONDS)
-    if result.exit_status not in (0, None):
+    result = await run_remote_piped(app, server, command, timeout=QUERY_TIMEOUT_SECONDS)
+    # grep 退出 1 = 无匹配，不是错误；141 = 行数/字节被 head 截断。
+    if result.exit_status not in (0, 1, None, 141):
         detail = (result.stderr or "Remote grep command failed").strip()[:1500]
         raise HTTPException(status_code=502, detail=detail)
     output = result.stdout or ""
-    return output, len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES
+    return output, len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES, (result.stderr or "").strip()[:1000]
 
 
 @asynccontextmanager
@@ -799,8 +873,8 @@ async def read_tail(request: ReadRequest, http_request: Request, config: dict[st
         if not chosen:
             return {"found": False, **payload, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
         paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
-        text, truncated = await read_tail_from_ssh(http_request.app, server, paths, request.lines)
-        return {"found": True, **payload, "files_read": chosen, "lines_requested_per_file": request.lines, "text": text, "possibly_truncated_by_bytes": truncated}
+        text, truncated, stderr = await read_tail_from_ssh(http_request.app, server, paths, request.lines)
+        return {"found": True, **payload, "files_read": chosen, "lines_requested_per_file": request.lines, "text": text, "possibly_truncated_by_bytes": truncated, "stderr": stderr}
 
     return {"results": await fan_out(unique_servers(request.servers), handler)}
 
@@ -816,8 +890,8 @@ async def search_logs(request: SearchRequest, http_request: Request, config: dic
         if not chosen:
             return {"found": False, **payload, "keyword": request.keyword, "message": "Could not automatically identify searchable log files for that day/type. Review candidate_files from discover_log_files and retry with file_ids."}
         paths = [str(PurePosixPath(log_dir) / item["relative_path"]) for item in chosen]
-        text, truncated = await search_files_on_ssh(http_request.app, server, paths, request.keyword, request.max_results)
-        return {"found": True, **payload, "keyword": request.keyword, "files_searched": chosen, "matches_text": text, "possibly_truncated_by_bytes": truncated}
+        text, truncated, stderr = await search_files_on_ssh(http_request.app, server, paths, request.keyword, request.max_results)
+        return {"found": True, **payload, "keyword": request.keyword, "files_searched": chosen, "matches_text": text, "possibly_truncated_by_bytes": truncated, "stderr": stderr}
 
     return {"results": await fan_out(unique_servers(request.servers), handler)}
 
@@ -834,17 +908,50 @@ async def execute_query(request: ExecuteQueryRequest, http_request: Request, con
         except CommandValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # 工作目录锁定在授权 log_dir；输出由服务端按字节截断。
-        wrapped = f"cd {shlex.quote(log_dir)} && {request.command} | head -c {MAX_READ_BYTES}"
-        result = await run_remote(http_request.app, server, wrapped, timeout=QUERY_TIMEOUT_SECONDS)
+        inner = f"cd {shlex.quote(log_dir)} && {request.command}"
+        result = await run_remote_piped(http_request.app, server, inner, timeout=QUERY_TIMEOUT_SECONDS)
         output = result.stdout or ""
+        truncated = len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES
+        # 141 = SIGPIPE（head 提前关管道，可能是服务端截断，也可是用户自己的 head），不是失败。
+        exit_code = 0 if result.exit_status == 141 else result.exit_status
         return {
             "module": request.module,
             "log_dir": log_dir,
             "executed_command": request.command,
-            "exit_code": result.exit_status,
+            "exit_code": exit_code,
             "stdout": output,
             "stderr": (result.stderr or "").strip()[:500],
-            "possibly_truncated_by_bytes": len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES,
+            "possibly_truncated_by_bytes": truncated,
+        }
+
+    return {"results": await fan_out(unique_servers(request.servers), handler)}
+
+
+@app.post("/execute-system-query")
+async def execute_system_query(request: SystemQueryRequest, http_request: Request, config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """多资产系统/Docker/K8s 只读查看：校验通过后在远程默认工作目录执行命令。"""
+
+    async def handler(server: str) -> dict[str, Any]:
+        if server not in (config.get("targets") or {}):
+            raise HTTPException(status_code=404, detail="Unknown server; not in the allowlist")
+        verdict = validate_system_info_command(request.command)
+        if verdict.verdict == Verdict.REJECTED:
+            raise HTTPException(status_code=400, detail=f"REJECTED: {verdict.message}")
+        if verdict.verdict == Verdict.UNKNOWN:
+            raise HTTPException(status_code=400, detail=f"UNKNOWN: {verdict.message}")
+        # ALLOWED — 系统命令不需要锁定 log_dir；在远程默认目录执行
+        result = await run_remote_piped(
+            http_request.app, server, request.command, timeout=QUERY_TIMEOUT_SECONDS
+        )
+        output = result.stdout or ""
+        truncated = len(output.encode("utf-8", errors="replace")) >= MAX_READ_BYTES
+        exit_code = 0 if result.exit_status == 141 else result.exit_status
+        return {
+            "executed_command": request.command,
+            "exit_code": exit_code,
+            "stdout": output,
+            "stderr": (result.stderr or "").strip()[:500],
+            "possibly_truncated_by_bytes": truncated,
         }
 
     return {"results": await fan_out(unique_servers(request.servers), handler)}
