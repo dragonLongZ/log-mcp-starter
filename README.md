@@ -81,20 +81,74 @@ targets:
 
 `.claude/skills/log-query/SKILL.md` 提供项目级 skill，规范 Claude 的查询流程：连接状态前置检查 → 资产/模块选择（未指明必问、已指明不问）→ 时间与类型澄清 → 意图-工具映射 → 多资产分组汇总 → 只读边界。在本项目目录启动 Claude Code 即自动可用。
 
-## 安装与运行
+## 部署模式
 
-```powershell
+### 远程部署（推荐，gateway 作为 systemd 服务 + MCP 独立进程）
+
+```
+┌─ 服务器 (Linux) ─────────────────────────────────────┐
+│                                                       │
+│  systemd: gateway_host.py     ← SSH 持久 + 心跳        │
+│  │  监听 127.0.0.1:8765                               │
+│  │  Web 仪表盘 http://server:8765/dashboard           │
+│  └────────────┬───────────────────────────────────────│
+│               │ HTTP bearer                           │
+│               ▼                                        │
+│  mcp_server.py (streamable HTTP)                       │
+│  监听 0.0.0.0:8000/mcp + bearer 鉴权                  │
+└───────────────────────────────────────────────────────┘
+```
+
+1. **安装依赖**
+```bash
 uv sync
 uv run python create_token.py
 ```
 
-在独立 PowerShell 窗口启动 bridge：
+2. **启动 Gateway（systemd 永久托管）**
+```ini
+# /etc/systemd/system/log-mcp-gateway.service
+[Unit]
+Description=Log MCP Gateway
+After=network-online.target
 
-```powershell
-uv run python gateway_host.py
+[Service]
+Type=simple
+WorkingDirectory=/opt/log-mcp
+ExecStart=/opt/log-mcp/.venv/bin/python gateway_host.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+systemctl daemon-reload && systemctl enable --now log-mcp-gateway
 ```
 
-保持该窗口运行。将 `claude-mcp.example.json` 复制为项目 `.mcp.json` 并改成当前工程绝对路径，再启动或重载 Claude Code。首次查询前用 `reconnect_asset` 认证所需资产（或配置 `auto_connect` 在启动时批量认证）；密码/MFA 只在 gateway 窗口输入。MCP 进程通过 stdio 与 Claude Code 通信，持久 SSH 会话在独立进程，不占用 MCP 的 stdin/stdout。
+3. **Web 仪表盘认证**
+   浏览器打开 `http://<服务器IP>:8765/dashboard?token=<local.token 内容>`，在表格中为每个资产填入 JumpServer 密码 + MFA 验证码，点击连接。连接成功后关闭浏览器即可——gateway 由 systemd 托管，SSH 由心跳任务维持。
+
+4. **启动 MCP 远程服务**
+```bash
+uv run python mcp_server.py
+# 监听 0.0.0.0:8000/mcp，bearer token 鉴权
+```
+
+5. **Claude Code 远程连接**
+   参照 `claude-mcp.example.json`，配置 `type: "http"` + `url` + `Authorization` header。
+
+### 本地开发（双进程 stdio 模式）
+
+```powershell
+# 终端 A：启动 gateway
+uv run python gateway_host.py
+# 终端 B：启动 MCP
+uv run python mcp_server.py
+```
+MCP 以 stdio 与 Claude Code 通信（`claude-mcp.example.json` 方案 B）。
+
+## 安装与运行（本地开发）
 
 ## 安全边界及当前限制
 

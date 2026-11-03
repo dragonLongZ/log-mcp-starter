@@ -1,9 +1,9 @@
-"""交互式 JumpServer SSH 会话与目录发现式日志桥接服务（多资产版）。
+"""JumpServer SSH 会话与目录发现式日志桥接服务（多资产版）。
 
-每个配置的资产（target）携带自己的 ssh_username，按需建立独立 SSH 连接
-（密码/MFA 在本专用终端完成）。后台心跳任务维持已建立会话的活性，
-防止 JumpServer 空闲超时断连。自由格式的只读查询在下发执行前，
-由 command_guard 进行静态校验。请在独立终端中运行本文件。
+每个配置的资产（target）携带自己的 ssh_username，按需建立独立 SSH 连接。
+认证可在 Web 仪表盘（/dashboard）中完成，也可回退到终端交互。
+后台心跳任务维持已建立会话的活性，防止 JumpServer 空闲超时断连。
+自由格式的只读查询在下发执行前，由 command_guard 进行静态校验。
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import asyncssh
 import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -40,6 +41,14 @@ MAX_SERVERS_PER_QUERY = 10
 DEFAULT_KEEPALIVE_MINUTES = 25
 QUERY_TIMEOUT_SECONDS = 60
 CONNECTION_TEST_TIMEOUT_SECONDS = 5
+
+PENDING_CREDENTIALS: dict[str, dict[str, str]] = {}
+"""Web 仪表盘提交的临时凭据：{server: {password, mfa_code}}。
+ConsoleMFA 在认证时优先使用；建成后立即清除。"""
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gateway 登录</title><style>body{font-family:system-ui,sans-serif;max-width:400px;margin:4rem auto;padding:0 1rem;background:#f5f5f5}h1{text-align:center}input{width:100%;padding:10px;margin:8px 0;border:1px solid #ddd;border-radius:6px;font-size:15px;box-sizing:border-box}button{width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer}button:hover{background:#2563eb}</style></head><body><h1>Log MCP Gateway</h1><p>请输入 API Token（即 local.token 内容）：</p><form id="f"><input type="password" id="tk" placeholder="Bearer Token" autofocus><button type="submit">进入仪表盘</button></form><script>document.getElementById('f').addEventListener('submit',function(e){e.preventDefault();window.location.href='/dashboard?token='+encodeURIComponent(document.getElementById('tk').value)})</script></body></html>"""
+
+DASHBOARD_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gateway Dashboard</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem;background:#f5f5f5}table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #eee;font-size:14px}th{background:#f8f9fa;font-weight:600}.connected{color:#22c55e}.disconnected{color:#ef4444}.connecting{color:#f59e0b}.needs_reauth{color:#f97316}button{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px}.btn-connect{background:#3b82f6;color:#fff}.btn-connect:hover{background:#2563eb}.btn-cancel{background:#e5e7eb;color:#333}.btn-cancel:hover{background:#d1d5db}.form-row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}input{padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:14px}.hidden{display:none}#err{background:#fef2f2;color:#dc2626;padding:10px;border-radius:6px;margin-bottom:1rem}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem}h1{margin:0;font-size:20px}.note{color:#888;font-size:13px}</style></head><body><div class="header"><h1>Gateway 仪表盘</h1><span class="note">每 10s 自动刷新</span></div><div id="err" class="hidden"></div><table><thead><tr><th>资产名</th><th>状态</th><th>最后心跳</th><th>断开原因</th><th>操作</th></tr></thead><tbody id="tb"></tbody></table><script>var T=new URLSearchParams(window.location.search).get('token');var S=/dashboard/status,U=/dashboard/connect;function L(s){var m={connected:'\\u2705 已连接',disconnected:'\\u274e 断连',connecting:'\\u23f3 认证中',needs_reauth:'\\u26a0\\ufe0f 需重认证'};return m[s]||s}async function R(){try{var r=await fetch(S,{headers:{Authorization:'Bearer '+T}});if(!r.ok)throw new Error(r.status+' '+((await r.json()).detail||''));render((await r.json()).connections)}catch(e){E(e.message)}}function render(cs){document.getElementById('tb').innerHTML=cs.map(function(c){return'<tr><td>'+c.server+'</td><td class="'+c.state+'">'+L(c.state)+'</td><td>'+(c.last_heartbeat||'\\u2014')+'</td><td>'+(c.disconnect_reason||'\\u2014')+'</td><td>'+(c.state!=='connecting'?'<button class="btn-connect" onclick="F(\\''+c.server+'\\')">\\u8fde\\u63a5</button>':'\\u8ba4\\u8bc1\\u4e2d...')+'</td></tr><tr id="fm-'+c.server+'" class="hidden"><td colspan="5"><div class="form-row"><input type="password" id="pw-'+c.server+'" placeholder="JumpServer \\u5bc6\\u7801" style="width:180px"><input type="text" id="mf-'+c.server+'" placeholder="MFA \\u9a8c\\u8bc1\\u7801" style="width:120px"><button class="btn-connect" onclick="C(\\''+c.server+'\\')">\\u786e\\u8ba4\\u8fde\\u63a5</button><button class="btn-cancel" onclick="H(\\''+c.server+'\\')">\\u53d6\\u6d88</button></div></td></tr>'}).join('')}function F(s){document.querySelectorAll('[id^=fm-]').forEach(function(e){e.classList.add('hidden')});document.getElementById('fm-'+s).classList.remove('hidden')}function H(s){document.getElementById('fm-'+s).classList.add('hidden')}async function C(s){var p=document.getElementById('pw-'+s).value,m=document.getElementById('mf-'+s).value;if(!p){E('\\u8bf7\\u8f93\\u5165\\u5bc6\\u7801');return}try{var r=await fetch(U,{method:'POST',headers:{Authorization:'Bearer '+T,'Content-Type':'application/json'},body:JSON.stringify({server:s,password:p,mfa_code:m})});var d=await r.json();if(!r.ok)throw new Error(d.detail||'\\u8fde\\u63a5\\u5931\\u8d25');H(s);await R()}catch(e){E(e.message)}}function E(m){var e=document.getElementById('err');e.textContent=m;e.classList.remove('hidden');setTimeout(function(){e.classList.add('hidden')},6000)}R();setInterval(R,10000)</script></body></html>"""
 
 AssetState = Literal["disconnected", "connecting", "connected", "needs_reauth"]
 
@@ -87,17 +96,20 @@ def read_token() -> str:
 
 
 class ConsoleMFA(asyncssh.SSHClient):
-    """在本专用终端弹出认证提示；密码按资产独立缓存复用。"""
+    """认证提示器：优先使用 Web 仪表盘提交的凭据，其次回退到终端交互。"""
 
     def __init__(self, server: str) -> None:
         self._server = server
         self._password: str | None = None
 
     def set_password(self, password: str) -> None:
-        """复用 connect() 里已经通过线程读取的密码，避免事件循环里再阻塞一次。"""
+        """复用 connect() 里已经设置的密码，避免事件循环里再阻塞一次。"""
         self._password = password
 
     def password_auth_requested(self) -> str:
+        creds = PENDING_CREDENTIALS.get(self._server)
+        if creds and creds.get("password"):
+            return creds["password"]
         if self._password is None:
             self._password = getpass.getpass(f"[{self._server}] JumpServer password: ")
         return self._password
@@ -111,16 +123,19 @@ class ConsoleMFA(asyncssh.SSHClient):
     ) -> list[str]:
         if instructions:
             print(instructions)
+        creds = PENDING_CREDENTIALS.get(self._server)
         answers: list[str] = []
         for prompt, echo in prompts:
-            labeled = f"[{self._server}] {prompt}"
             lowered = prompt.lower()
             if "password" in lowered:
-                answer = self.password_auth_requested()
+                answers.append(self.password_auth_requested())
+            elif creds and creds.get("mfa_code"):
+                # Web 仪表盘提交了 MFA 验证码，优先使用。
+                answers.append(creds["mfa_code"])
             else:
-                # OTP/MFA/验证码等其他键盘交互提示。
-                answer = input(labeled) if echo else getpass.getpass(labeled)
-            answers.append(answer)
+                # 回退：终端交互输入。
+                labeled = f"[{self._server}] {prompt}"
+                answers.append(input(labeled) if echo else getpass.getpass(labeled))
         return answers
 
 
@@ -160,14 +175,20 @@ class AssetConnection:
         }
 
     async def connect(self) -> None:
-        """在后台任务中执行；密码/MFA 提示出现在 gateway 终端。"""
+        """在后台任务中执行；优先使用 Web 凭据（免终端），否则回退到终端提示。"""
         try:
-            print(f"[{self.server}] Connecting to JumpServer; complete password/MFA in this terminal.")
-            # 密码在独立线程读取，避免 getpass 阻塞事件循环（轮询/心跳还能响应）。
-            password = await asyncio.to_thread(
-                getpass.getpass, f"[{self.server}] JumpServer password: "
-            )
-            self._mfa.set_password(password)
+            creds = PENDING_CREDENTIALS.get(self.server)
+            if creds and creds.get("password"):
+                print(f"[{self.server}] Connecting via web-submitted credentials.")
+                self._mfa.set_password(creds["password"])
+                password = creds["password"]
+            else:
+                print(f"[{self.server}] Connecting to JumpServer; complete password/MFA in this terminal.")
+                # 密码在独立线程读取，避免 getpass 阻塞事件循环（轮询/心跳还能响应）。
+                password = await asyncio.to_thread(
+                    getpass.getpass, f"[{self.server}] JumpServer password: "
+                )
+                self._mfa.set_password(password)
             conn = await asyncssh.connect(
                 self.host,
                 port=self.port,
@@ -185,15 +206,19 @@ class AssetConnection:
         except (EOFError, KeyboardInterrupt):
             self.state = "disconnected"
             self.disconnect_reason = "authentication cancelled"
+            PENDING_CREDENTIALS.pop(self.server, None)
             return
         except asyncio.CancelledError:
             self.state = "disconnected"
+            PENDING_CREDENTIALS.pop(self.server, None)
             raise
         except (asyncssh.Error, OSError) as exc:
             self.state = "needs_reauth"
             self.disconnect_reason = f"connect failed: {type(exc).__name__}: {exc}"[:300]
+            PENDING_CREDENTIALS.pop(self.server, None)
             print(f"[{self.server}] Connection failed: {self.disconnect_reason}")
             return
+        PENDING_CREDENTIALS.pop(self.server, None)
         self.conn = conn
         self.state = "connected"
         self.disconnect_reason = None
@@ -320,6 +345,7 @@ class ConnectionManager:
             try:
                 await asset.connect()
             except Exception as exc:
+                PENDING_CREDENTIALS.pop(asset.server, None)
                 if asset.state == "connecting":
                     asset.state = "needs_reauth"
                     asset.disconnect_reason = f"connect failed: {type(exc).__name__}: {exc}"[:300]
@@ -406,6 +432,12 @@ class SystemQueryRequest(BaseModel):
 
 class ConnectRequest(BaseModel):
     server: str = Field(min_length=1, max_length=100)
+
+
+class DashboardConnectRequest(BaseModel):
+    server: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=256)
+    mfa_code: str = Field(default="", max_length=32)
 
 
 def check_bearer(authorization: str | None = Header(default=None)) -> None:
@@ -779,8 +811,8 @@ async def lifespan(app: FastAPI):
         else:
             print(f"[warn] auto_connect: unknown server '{server}' ignored.")
     print(
-        "Gateway ready. Authenticate assets via the reconnect_asset MCP tool (or POST /connect); "
-        "password/MFA prompts appear in this terminal."
+        "Gateway ready. Authenticate assets via the reconnect_asset MCP tool, "
+        "POST /connect, or the web dashboard at /dashboard."
     )
     try:
         yield
@@ -955,6 +987,37 @@ async def execute_system_query(request: SystemQueryRequest, http_request: Reques
         }
 
     return {"results": await fan_out(unique_servers(request.servers), handler)}
+
+
+# ── Web 仪表盘 ──────────────────────────────────────────────
+
+
+@app.get("/dashboard")
+async def dashboard(token: str | None = None) -> HTMLResponse:
+    """Web 仪表盘：访问 /dashboard?token=<local.token> 查看全部资产状态并提交认证凭据。"""
+    if not token or not secrets.compare_digest(token, read_token()):
+        return HTMLResponse(LOGIN_HTML)
+    return HTMLResponse(DASHBOARD_HTML.replace("$TOKEN", token))
+
+
+@app.get("/dashboard/status")
+async def dashboard_status(request: Request, _: None = Depends(check_bearer)) -> dict[str, Any]:
+    """返回所有资产连接状态（JSON），供仪表盘自动轮询。"""
+    return {"connections": request.app.state.manager.statuses()}
+
+
+@app.post("/dashboard/connect")
+async def dashboard_connect(
+    body: DashboardConnectRequest,
+    request: Request,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """仪表盘提交 JumpServer 认证凭据，触发指定资产后台连接。"""
+    PENDING_CREDENTIALS[body.server] = {
+        "password": body.password,
+        "mfa_code": body.mfa_code,
+    }
+    return request.app.state.manager.request_connect(body.server)
 
 
 if __name__ == "__main__":

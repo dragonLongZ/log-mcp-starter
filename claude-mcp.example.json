@@ -1,5 +1,16 @@
 {
+  "comment": "方案 A: 远程 streamable HTTP（推荐，MCP 部署在服务器上，gateway 同机运行）",
   "mcpServers": {
+    "log-mcp": {
+      "type": "http",
+      "url": "http://your-server-ip:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer <粘贴 local.token 内容>"
+      }
+    }
+  },
+  "comment_alt": "方案 B: 本地 stdio（gateway 在另一终端运行）",
+  "mcpServers_alt": {
     "log-mcp": {
       "command": "uv",
       "args": [

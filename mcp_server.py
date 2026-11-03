@@ -1,10 +1,16 @@
-"""stdio MCP 客户端：对接本地持久化 JumpServer SSH 桥接服务（多资产版）。"""
+"""远程 streamable HTTP MCP 服务器：对接本地持久化 JumpServer SSH 桥接服务（多资产版）。"""
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Literal
+import secrets as _secrets
 import httpx
 import yaml
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
@@ -148,7 +154,14 @@ def format_grouped(results: list[dict[str, Any]], formatter: Callable[[dict[str,
     return "\n\n".join(blocks)
 
 
-mcp = FastMCP("JumpServer Multi-asset Log MCP")
+_mcp_cfg = (load_config() or {}).get("mcp_server") or {}
+_bind_host = str(_mcp_cfg.get("bind_host", "0.0.0.0"))
+
+mcp = FastMCP(
+    "JumpServer Multi-asset Log MCP",
+    host=_bind_host,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 @mcp.tool()
@@ -361,4 +374,28 @@ async def execute_system_query(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    config = load_config()
+    mcp_cfg = config.get("mcp_server") or {}
+    bind_host = str(mcp_cfg.get("bind_host", "0.0.0.0"))
+    bind_port = int(mcp_cfg.get("bind_port", 8000))
+
+    app = mcp.streamable_http_app()
+
+    expected_token = TOKEN_PATH.read_text(encoding="utf-8").strip()
+
+    class BearerMiddleware(BaseHTTPMiddleware):
+        """静态 bearer token 鉴权：只允许携带正确 token 的请求通过。"""
+        async def dispatch(self, request: StarletteRequest, call_next):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return JSONResponse({"error": "Missing bearer token"}, status_code=401,
+                                    headers={"WWW-Authenticate": "Bearer"})
+            supplied = auth.removeprefix("Bearer ").strip()
+            if not _secrets.compare_digest(supplied, expected_token):
+                return JSONResponse({"error": "Invalid bearer token"}, status_code=401,
+                                    headers={"WWW-Authenticate": "Bearer"})
+            return await call_next(request)
+
+    app.add_middleware(BearerMiddleware)
+
+    uvicorn.run(app, host=bind_host, port=bind_port, log_level="warning")
