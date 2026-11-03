@@ -25,13 +25,17 @@ def load_config() -> dict[str, Any]:
 
 
 def bridge_settings() -> tuple[str, str]:
-    """读取本地 bridge 的地址与 bearer token。"""
+    """读取本地 bridge 的连接地址与 bearer token。
+    mcp_server 始终通过 127.0.0.1 连接 gateway（同机部署），
+    与 gateway 对外监听的 bind_host 无关。
+    """
     if not TOKEN_PATH.exists():
         raise RuntimeError("local.token missing; run `uv run python create_token.py` first.")
     config = load_config()
     jump = config["jumpserver"]
     token = TOKEN_PATH.read_text(encoding="utf-8").strip()
-    base_url = f"http://{jump.get('bind_host', '127.0.0.1')}:{int(jump.get('bind_port', 8765))}"
+    gateway_port = int(jump.get("bind_port", 8765))
+    base_url = f"http://127.0.0.1:{gateway_port}"
     return base_url, token
 
 
