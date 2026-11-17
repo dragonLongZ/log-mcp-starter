@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Log context",
+    "description": "Pick a JumpServer asset and module, or a K8S namespace and pod, in the right sidebar and insert the log-query context into the composer."
+  }
+}

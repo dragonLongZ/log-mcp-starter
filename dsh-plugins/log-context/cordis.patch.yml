@@ -1,0 +1,36 @@
+# log-context bundle patch.
+#
+# 部署形态：本项目按 README 的「远程部署」运行 —— gateway_host.py 与 mcp_server.py 都在
+# 10.12.0.101 上（8000 = MCP，8765 = gateway），token 是该机器上的 local.token。
+# 本机（Windows）只跑 DSH；插件通过 HTTP 访问这台服务器。
+#
+# 行说明：
+# - log-context-mcp: 复用已有 mcp_server.py，模型拿到 mcp__logmcp__* 工具。
+#   token 在挂载时从插件目录下的 .token 读取（该文件已被 .gitignore 忽略）；
+#   文件缺失时降级为显式 "Bearer missing-token"，不会让 profile 加载失败。
+# - log-context: 插件 Host + Client 两半（catalog 接口、系统提示、右栏标签页）。
+#
+# 换机器 / 换端口 / 换 token 时只改下面三处：url、gatewayBaseUrl、.token 文件内容。
+- insert:
+    - id: log-context-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: logmcp
+        transport: streamable-http
+        url: 'http://10.12.0.101:8000/mcp'
+        headers:
+          Authorization: !!js '(function(){try{return "Bearer " + process.getBuiltinModule("node:fs").readFileSync("D:/pythonProject/log-mcp-starter/dsh-plugins/log-context/.token","utf8").trim()}catch(e){return "Bearer missing-token"}})()'
+        failOnStartupError: false
+        # 默认 10 次重连在 VPN / 网络未就绪时会很快烧完，随后工具被移除、需要重载插件。
+        # 这里放大预算，给开机/重连 VPN 留足时间（≈ 最多 1 小时，30s 封顶）。
+        reconnect:
+          enabled: true
+          maxAttempts: 120
+          maxDelayMs: 30000
+
+    - id: log-context
+      name: '@local/dsh-log-context'
+      config:
+        projectDir: 'D:/pythonProject/log-mcp-starter'
+        gatewayBaseUrl: 'http://10.12.0.101:8765'
+        tokenPath: 'D:/pythonProject/log-mcp-starter/dsh-plugins/log-context/.token'

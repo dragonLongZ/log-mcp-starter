@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "日志上下文",
+    "description": "在右栏选择 JumpServer 资产、模块或 K8S 命名空间与 Pod，一键把日志查询上下文插入输入框。"
+  }
+}

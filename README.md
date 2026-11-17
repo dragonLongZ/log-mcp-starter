@@ -81,6 +81,29 @@ targets:
 
 `.claude/skills/log-query/SKILL.md` 提供项目级 skill，规范 Claude 的查询流程：连接状态前置检查 → 资产/模块选择（未指明必问、已指明不问）→ 时间与类型澄清 → 意图-工具映射 → 多资产分组汇总 → 只读边界。在本项目目录启动 Claude Code 即自动可用。
 
+## DSH 插件（日志上下文）
+
+`dsh-plugins/log-context/` 是同一套能力的 DSH 插件：右栏点选「环境 → 资产 → 模块 / K8S 命名空间、Pod → 动作模板」，
+一键把「查哪里」写进对话输入框，你只需要补一句问题。详见 [dsh-plugins/log-context/README.md](dsh-plugins/log-context/README.md)。
+
+它由两部分组成，都不改动上面的 Python 业务代码：
+
+1. **能力**：bundle patch 插入 `@deepseek-ai/dsh-mcp-client`，连本项目的 `mcp_server.py`，
+   模型拿到 `mcp__logmcp__*` 工具；并追加一段系统提示，看到「【日志上下文】」块就直接按块内坐标查询。
+2. **交互**：Host 半读 `config/log_targets.yaml` 并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页
+   与输入框左侧入口按钮。
+
+安装（DSH 会话里执行）：
+
+```
+plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-plugins\\log-context")
+```
+
+部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `10.12.0.101`（8000 = MCP，8765 = gateway），
+Windows 本机只跑 DSH。插件用的 token 在 `dsh-plugins/log-context/.token`（已被 `.gitignore` 忽略），
+内容是该服务器上的 `local.token` —— 注意仓库根目录的 `local.token` 可能是本机旧 token，两者不一定相同。
+地址与 token 换机器时改 `dsh-plugins/log-context/cordis.patch.yml` 里的 `url`、`gatewayBaseUrl` 与 `.token`。
+
 ## 部署模式
 
 ### 远程部署（推荐，gateway 作为 systemd 服务 + MCP 独立进程）
