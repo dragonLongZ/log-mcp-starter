@@ -1001,7 +1001,11 @@ async def dashboard(token: str | None = None) -> HTMLResponse:
 
 
 @app.get("/dashboard/status")
-async def dashboard_status(request: Request, _: None = Depends(check_bearer)) -> dict[str, Any]:
+async def dashboard_status(
+    request: Request,
+    _config: dict[str, Any] = Depends(get_synced_config),
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
     """返回所有资产连接状态（JSON），供仪表盘自动轮询。"""
     return {"connections": request.app.state.manager.statuses()}
 
@@ -1010,6 +1014,7 @@ async def dashboard_status(request: Request, _: None = Depends(check_bearer)) ->
 async def dashboard_connect(
     body: DashboardConnectRequest,
     request: Request,
+    _config: dict[str, Any] = Depends(get_synced_config),
     _: None = Depends(check_bearer),
 ) -> dict[str, Any]:
     """仪表盘提交 JumpServer 认证凭据，触发指定资产后台连接。"""
