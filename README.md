@@ -93,7 +93,7 @@ targets:
 |---|---|
 | 存储 | `config/system_allowlist.yaml`（可手工编辑，改完同样实时生效） |
 | `GET /dashboard/allowlist` | 列出当前条目、文件路径与解析警告 |
-| `POST /dashboard/allowlist` | `{name, denied[], note}` 新增或覆盖一条 |
+| `POST /dashboard/allowlist` | `{name, denied[], note}` 新增或覆盖一条；`denied` 可填 flag 或子命令 |
 | `DELETE /dashboard/allowlist?name=htop` | 删除一条 |
 | `POST /dashboard/allowlist/check` | `{command}` 试运行判定，返回 `{verdict, message}` |
 
@@ -102,7 +102,9 @@ targets:
 - **前缀匹配**：按 token 前缀匹配，登记 `docker compose ls` 只放行以这三个 token 开头的命令；`name` 最多 4 个 token，且不允许 `; & | $ \` > < ( )` 等 shell 元字符。
 - **黑名单优先**：`rm`、`sudo`、`docker rm`、`kubectl delete` 等黑名单命令**不能**被登记，也不能用更短前缀绕过（例如登记 `docker` 会被拒绝，因为它会放行 `docker rm`）。
 - **通用规则始终生效**：禁止输出重定向、命令串联（`; && ||`）、换行与 `$(`/反引号，awk `system()`/`getline`/`print >` 仍被拒绝；管道最多 3 段。
-- **每条可再禁 flag**：登记 `ncdu` 时同时填 `denied: ["-o"]`，则 `ncdu` 放行、`ncdu -o out.txt` 仍被拒绝。
+- **每条可再禁参数**：支持两种形态——flag（`-o`、`--output`）与子命令（`VM.set_flag`、`GC.run`）。
+  例如登记 `jcmd` 且禁用 `VM.set_flag,GC.run,GC.run_finalization`，则 `jcmd 1234 VM.version` 放行、
+  `jcmd 1234 GC.run` 仍被拒绝；登记 `ncdu` 且禁用 `-o`，则 `ncdu` 放行、`ncdu -o out.txt` 仍被拒绝。
 - 白名单文件损坏不会拖垮网关：坏条目被跳过，并在接口 `warnings` 与页面底部提示。
 
 ## 配套 Skill

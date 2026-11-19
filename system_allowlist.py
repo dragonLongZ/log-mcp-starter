@@ -51,6 +51,11 @@ ALLOWED_NAME_CHARS = frozenset(
     "-_.:/=+@*?[]%"
 )
 
+# “禁用参数”在 name 的字符集之外，还允许 - 前缀 flag 与 jcmd 那种 a.b.c 子命令，
+# 但仍然拒绝空白与一切 shell 元字符。
+DENIED_EXTRA_CHARS = ALLOWED_NAME_CHARS
+MAX_DENIED_LEN = 60
+
 
 class AllowlistError(ValueError):
     """白名单条目不合法（由 API 层转成 400）。"""
@@ -137,7 +142,14 @@ def normalize_name(raw: str) -> str:
 
 
 def normalize_denied(raw: Iterable[str] | str | None) -> tuple[str, ...]:
-    """校验 flag 列表（支持列表或逗号分隔字符串）。"""
+    """校验“仍禁止的参数”列表（支持列表或逗号分隔字符串）。
+
+    两种形态都接受：
+      * flag：``-o``、``--output``、``-f``（按 token 精确匹配，也支持 ``--flag=value``）；
+      * 子命令 / 子动作：``VM.set_flag``、``GC.run``、``GC.run_finalization``
+        （jcmd、systemctl 这类命令的危险动作不是 flag 而是子命令，必须能禁）。
+    含 shell 元字符的值一律拒绝。
+    """
     if raw is None:
         return ()
     if isinstance(raw, str):
@@ -146,15 +158,22 @@ def normalize_denied(raw: Iterable[str] | str | None) -> tuple[str, ...]:
         items = list(raw)
     denied: list[str] = []
     for item in items:
-        flag = str(item).strip()
-        if not flag:
+        value = str(item).strip()
+        if not value:
             continue
-        if not flag.startswith("-"):
-            raise AllowlistError(f"Forbidden flag must start with '-': {flag!r}")
-        if len(flag) > 40:
-            raise AllowlistError(f"Forbidden flag is too long: {flag!r}")
-        if flag not in denied:
-            denied.append(flag)
+        if len(value) > MAX_DENIED_LEN:
+            raise AllowlistError(f"Forbidden parameter is too long: {value!r}")
+        bad = sorted({
+            ch for ch in value
+            if not ch.isalnum() and ch not in DENIED_EXTRA_CHARS
+        })
+        if bad:
+            raise AllowlistError(
+                f"Invalid forbidden parameter {value!r}: may not contain "
+                + " ".join(repr(ch) for ch in bad)
+            )
+        if value not in denied:
+            denied.append(value)
     return tuple(denied)
 
 

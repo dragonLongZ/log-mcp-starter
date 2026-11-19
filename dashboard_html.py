@@ -47,17 +47,18 @@ code{background:#f3f4f6;padding:1px 5px;border-radius:3px;font-size:13px}
 黑名单命令（<code>rm</code>、<code>sudo</code>、<code>docker rm</code> 等）与“禁止重定向/串联/命令替换”等通用规则仍然优先，无法通过这里绕过。
 </p>
 <div class="form-row">
-  <input id="in-name" placeholder="命令，如 htop / ifconfig / docker compose ls" style="width:320px">
-  <input id="in-denied" placeholder="禁用的 flag（可选，逗号分隔，如 -d,--delay）" style="width:280px">
+  <input id="in-name" placeholder="命令，如 jcmd / htop / docker compose ls" style="width:320px">
+  <input id="in-denied" placeholder="禁用参数（可选，逗号分隔，如 VM.set_flag,GC.run 或 -d,--delay" style="width:320px">
   <input id="in-note" placeholder="备注（可选）" style="width:180px">
   <button class="btn-connect" onclick="addEntry()">添加 / 更新</button>
 </div>
+<div id="al-msg" class="hidden"></div>
 <div class="form-row">
   <input id="in-test" placeholder="试运行校验：输入一条完整命令，看网关会怎么判定" style="width:420px">
   <button class="btn-cancel" onclick="checkCmd()">校验</button>
   <span id="test-out" class="note"></span>
 </div>
-<table><thead><tr><th>命令</th><th>禁用的 flag</th><th>备注</th><th>添加时间</th><th>操作</th></tr></thead><tbody id="alb"></tbody></table>
+<table><thead><tr><th>命令</th><th>禁用参数</th><th>备注</th><th>添加时间</th><th>操作</th></tr></thead><tbody id="alb"></tbody></table>
 <p class="note" id="al-path"></p>
 
 <script>
@@ -65,6 +66,17 @@ var T=__TOKEN__;
 function H(extra){var h={Authorization:'Bearer '+T};if(extra){for(var k in extra)h[k]=extra[k];}return h;}
 function E(m){var e=document.getElementById('err');e.textContent=m;e.classList.remove('hidden');setTimeout(function(){e.classList.add('hidden');},6000);}
 function OK(m){var e=document.getElementById('msg');e.textContent=m;e.classList.remove('hidden');setTimeout(function(){e.classList.add('hidden');},4000);}
+/* 白名单面板就地提示：页面滚动到底部时也能看到结果，不会“点了没反应”。 */
+function AE(m,ok){
+  var e=document.getElementById('al-msg');
+  e.textContent=m;
+  e.style.cssText=ok
+    ?'background:#f0fdf4;color:#15803d;padding:10px;border-radius:6px;margin:8px 0'
+    :'background:#fef2f2;color:#dc2626;padding:10px;border-radius:6px;margin:8px 0';
+  e.classList.remove('hidden');
+  clearTimeout(e._t);
+  e._t=setTimeout(function(){e.classList.add('hidden');},8000);
+}
 function el(tag,text,cls){var n=document.createElement(tag);if(text!==undefined&&text!==null)n.textContent=text;if(cls)n.className=cls;return n;}
 function lookup(o,s){var m={connected:'\\u2705 已连接',disconnected:'\\u274e 断连',connecting:'\\u23f3 认证中',needs_reauth:'\\u26a0\\ufe0f 需重认证'};return m[s]||s;}
 
@@ -146,27 +158,27 @@ async function loadAllowlist(){
     if(!r.ok)throw new Error(d.detail||'\\u52a0\\u8f7d\\u5931\\u8d25');
     renderAllowlist(d.entries||[]);
     document.getElementById('al-path').textContent='配置文件：'+(d.path||'')+(d.warnings&&d.warnings.length?('　⚠ '+d.warnings.join('; ')):'');
-  }catch(e){E(e.message);}
+  }catch(e){AE('\\u52a0\\u8f7d\\u767d\\u540d\\u5355\\u5931\\u8d25\\uff1a'+e.message,false);E(e.message);}
 }
 async function addEntry(){
   var name=document.getElementById('in-name').value.trim();
-  if(!name){E('\\u8bf7\\u8f93\\u5165\\u547d\\u4ee4');return;}
+  if(!name){AE('\\u8bf7\\u8f93\\u5165\\u547d\\u4ee4',false);return;}
   var denied=document.getElementById('in-denied').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
   var note=document.getElementById('in-note').value.trim();
   try{
     var r=await fetch('/dashboard/allowlist',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify({name:name,note:note,denied:denied})});
     var d=await r.json();if(!r.ok)throw new Error(d.detail||'\\u4fdd\\u5b58\\u5931\\u8d25');
     document.getElementById('in-name').value='';document.getElementById('in-denied').value='';document.getElementById('in-note').value='';
-    renderAllowlist(d.entries||[]);OK('\\u5df2\\u4fdd\\u5b58\\uff0c\\u7acb\\u5373\\u751f\\u6548: '+name);
-  }catch(e){E(e.message);}
+    renderAllowlist(d.entries||[]);AE('\\u5df2\\u4fdd\\u5b58\\uff0c\\u7acb\\u5373\\u751f\\u6548\\uff1a'+name+(denied.length?('\\uff08\\u7981\\u7528 '+denied.join(', ')+'\\uff09'):''),true);
+  }catch(e){AE('\\u4fdd\\u5b58\\u5931\\u8d25\\uff1a'+e.message,false);E(e.message);}
 }
 async function delEntry(name){
   if(!confirm('\\u5220\\u9664\\u767d\\u540d\\u5355\\u9879\\u300c'+name+'\\u300d\\uff1f\\u5220\\u9664\\u540e\\u8be5\\u547d\\u4ee4\\u4f1a\\u91cd\\u65b0\\u8fd4\\u56de UNKNOWN\\u3002'))return;
   try{
     var r=await fetch('/dashboard/allowlist?name='+encodeURIComponent(name),{method:'DELETE',headers:H()});
     var d=await r.json();if(!r.ok)throw new Error(d.detail||'\\u5220\\u9664\\u5931\\u8d25');
-    renderAllowlist(d.entries||[]);OK('\\u5df2\\u5220\\u9664: '+name);
-  }catch(e){E(e.message);}
+    renderAllowlist(d.entries||[]);AE('\\u5df2\\u5220\\u9664\\uff1a'+name,true);
+  }catch(e){AE('\\u5220\\u9664\\u5931\\u8d25\\uff1a'+e.message,false);E(e.message);}
 }
 async function checkCmd(){
   var cmd=document.getElementById('in-test').value.trim();

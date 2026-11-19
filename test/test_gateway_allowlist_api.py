@@ -94,6 +94,24 @@ class TestAllowlistApi:
         assert validate_system_info_command("ncdu").verdict == Verdict.ALLOWED
         assert validate_system_info_command("ncdu -o out.txt").verdict == Verdict.REJECTED
 
+    def test_denied_subcommands_survive_roundtrip(self, client, auth):
+        """jcmd 场景：禁用参数是子命令而不是 flag，网页提交后必须能保存并生效。"""
+        response = client.post(
+            "/dashboard/allowlist",
+            headers=auth,
+            json={
+                "name": "jcmd",
+                "denied": ["VM.set_flag", "GC.run", "GC.run_finalization"],
+                "note": "JVM 诊断",
+            },
+        )
+        assert response.status_code == 200, response.json()
+        assert response.json()["entries"][0]["denied"] == [
+            "VM.set_flag", "GC.run", "GC.run_finalization",
+        ]
+        assert validate_system_info_command("jcmd 1234 VM.version").verdict == Verdict.ALLOWED
+        assert validate_system_info_command("jcmd 1234 GC.run").verdict == Verdict.REJECTED
+
     def test_check_does_not_require_asset_connection(self, client, auth):
         # 试运行只做静态判定，不应该因为资产未连接而失败
         body = client.post(

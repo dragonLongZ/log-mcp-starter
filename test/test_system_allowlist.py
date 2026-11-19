@@ -45,8 +45,21 @@ class TestNameValidation:
             system_allowlist.normalize_name("   ")
 
     def test_denied_flags_must_start_with_dash(self):
+        # flag 与 jcmd 子命令两种形态都合法，但 shell 元字符不行
+        assert system_allowlist.normalize_denied(["VM.set_flag"]) == ("VM.set_flag",)
         with pytest.raises(system_allowlist.AllowlistError):
-            system_allowlist.normalize_denied(["output"])
+            system_allowlist.normalize_denied(["a;b"])
+
+    def test_denied_accepts_subcommands(self):
+        """jcmd 这类命令的危险动作是子命令而非 flag，必须能登记。"""
+        assert system_allowlist.normalize_denied(
+            ["VM.set_flag", "GC.run", "GC.run_finalization"]
+        ) == ("VM.set_flag", "GC.run", "GC.run_finalization")
+
+    def test_denied_rejects_shell_metacharacters(self):
+        for bad in ("x y", "a;b", "a|b", "a&b", "a$b", "a`b", "a>b"):
+            with pytest.raises(system_allowlist.AllowlistError):
+                system_allowlist.normalize_denied([bad])
 
     def test_denied_flags_from_comma_string(self):
         assert system_allowlist.normalize_denied("-o, --output ,") == ("-o", "--output")
@@ -105,7 +118,32 @@ class TestHotReload:
         assert entries[0].note == "second"
 
 
+class TestRealWorldCommands:
+    """真实场景：jcmd 的危险动作是子命令（VM.set_flag/GC.run），不是 flag。"""
+
+    def test_jcmd_selective_subcommands(self):
+        system_allowlist.add_entry(
+            "jcmd", denied=["VM.set_flag", "GC.run", "GC.run_finalization"], note="JVM 诊断"
+        )
+        # 只读查询放行
+        assert validate_system_info_command("jcmd 1234 VM.version").verdict == Verdict.ALLOWED
+        assert validate_system_info_command("jcmd 1234 help").verdict == Verdict.ALLOWED
+        assert validate_system_info_command("jcmd -l").verdict == Verdict.ALLOWED
+        # 危险子命令仍拒绝
+        assert validate_system_info_command("jcmd 1234 GC.run").verdict == Verdict.REJECTED
+        assert validate_system_info_command("jcmd 1234 GC.run_finalization").verdict == Verdict.REJECTED
+        assert validate_system_info_command(
+            "jcmd 1234 VM.set_flag ManagementServer.Verbose true"
+        ).verdict == Verdict.REJECTED
+
+    def test_jcmd_without_denied_allows_everything(self):
+        # 不填禁用参数时，登记即整体放行（用户自己的选择）
+        system_allowlist.add_entry("jcmd")
+        assert validate_system_info_command("jcmd 1234 GC.run").verdict == Verdict.ALLOWED
+
+
 class TestGuardsStillApply:
+
     """自定义白名单不能削弱黑名单与通用安全规则。"""
 
     def test_denied_flag_on_custom_entry(self):
