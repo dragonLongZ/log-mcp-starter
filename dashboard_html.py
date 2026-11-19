@@ -78,7 +78,7 @@ function AE(m,ok){
   e._t=setTimeout(function(){e.classList.add('hidden');},8000);
 }
 function el(tag,text,cls){var n=document.createElement(tag);if(text!==undefined&&text!==null)n.textContent=text;if(cls)n.className=cls;return n;}
-function lookup(o,s){var m={connected:'\\u2705 已连接',disconnected:'\\u274e 断连',connecting:'\\u23f3 认证中',needs_reauth:'\\u26a0\\ufe0f 需重认证'};return m[s]||s;}
+function lookup(s){var m={connected:'\\u2705 已连接',disconnected:'\\u274e 断连',connecting:'\\u23f3 认证中',needs_reauth:'\\u26a0\\ufe0f 需重认证'};return m[s]||s||'\\u2014';}
 
 /* ── 资产连接状态 ───────────────────────────── */
 var openForm=null;

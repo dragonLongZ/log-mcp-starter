@@ -132,6 +132,17 @@ class TestDashboardPage:
         page = client.get("/dashboard", params={"token": "wrong"})
         assert "登录" in page.text
 
+    def test_lookup_takes_single_argument(self, client):
+        """回归：lookup(o,s) 双参数签名会让状态列渲染成空（曾导致网页看不到「已连接」）。"""
+        import re
+
+        import gateway_host
+
+        page = client.get("/dashboard", params={"token": gateway_host.read_token()})
+        js = re.search(r"<script>(.*?)</script>", page.text, re.S).group(1)
+        assert re.search(r"function lookup\(\s*s\s*\)", js), "lookup 必须只接收一个状态参数"
+        assert "lookup(c.state)" in js
+
     def test_dashboard_contains_allowlist_panel(self, client):
         import gateway_host
 
