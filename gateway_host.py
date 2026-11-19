@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import hashlib
+import json
 import secrets
 import shlex
 from contextlib import asynccontextmanager
@@ -25,8 +26,17 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
+import system_allowlist
 from command_guard import CommandValidationError, validate_query_command
-from system_guard import Verdict, ValidationResult, validate_system_info_command
+from dashboard_html import DASHBOARD_HTML, LOGIN_HTML
+from system_allowlist import (
+    AllowEntry,
+    AllowlistError,
+    add_entry,
+    load_allowlist,
+    remove_entry,
+)
+from system_guard import Verdict, validate_system_info_command
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
@@ -46,9 +56,6 @@ PENDING_CREDENTIALS: dict[str, dict[str, str]] = {}
 """Web 仪表盘提交的临时凭据：{server: {password, mfa_code}}。
 ConsoleMFA 在认证时优先使用；建成后立即清除。"""
 
-LOGIN_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gateway 登录</title><style>body{font-family:system-ui,sans-serif;max-width:400px;margin:4rem auto;padding:0 1rem;background:#f5f5f5}h1{text-align:center}input{width:100%;padding:10px;margin:8px 0;border:1px solid #ddd;border-radius:6px;font-size:15px;box-sizing:border-box}button{width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer}button:hover{background:#2563eb}</style></head><body><h1>Log MCP Gateway</h1><p>请输入 API Token（即 local.token 内容）：</p><form id="f"><input type="password" id="tk" placeholder="Bearer Token" autofocus><button type="submit">进入仪表盘</button></form><script>document.getElementById('f').addEventListener('submit',function(e){e.preventDefault();window.location.href='/dashboard?token='+encodeURIComponent(document.getElementById('tk').value)})</script></body></html>"""
-
-DASHBOARD_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gateway Dashboard</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem;background:#f5f5f5}table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #eee;font-size:14px}th{background:#f8f9fa;font-weight:600}.connected{color:#22c55e}.disconnected{color:#ef4444}.connecting{color:#f59e0b}.needs_reauth{color:#f97316}button{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px}.btn-connect{background:#3b82f6;color:#fff}.btn-connect:hover{background:#2563eb}.btn-cancel{background:#e5e7eb;color:#333}.btn-cancel:hover{background:#d1d5db}.form-row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}input{padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:14px}.hidden{display:none}#err{background:#fef2f2;color:#dc2626;padding:10px;border-radius:6px;margin-bottom:1rem}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem}h1{margin:0;font-size:20px}.note{color:#888;font-size:13px}</style></head><body><div class="header"><h1>Gateway 仪表盘</h1><span class="note">每 10s 自动刷新</span></div><div id="err" class="hidden"></div><table><thead><tr><th>资产名</th><th>状态</th><th>最后心跳</th><th>断开原因</th><th>操作</th></tr></thead><tbody id="tb"></tbody></table><script>var T=new URLSearchParams(window.location.search).get('token');var S='/dashboard/status',U='/dashboard/connect';function L(s){var m={connected:'\\u2705 已连接',disconnected:'\\u274e 断连',connecting:'\\u23f3 认证中',needs_reauth:'\\u26a0\\ufe0f 需重认证'};return m[s]||s}async function R(){try{var r=await fetch(S,{headers:{Authorization:'Bearer '+T}});if(!r.ok)throw new Error(r.status+' '+((await r.json()).detail||''));render((await r.json()).connections)}catch(e){E(e.message)}}function render(cs){if(document.querySelector('[id^=fm-]:not(.hidden)'))return;document.getElementById('tb').innerHTML=cs.map(function(c){return'<tr><td>'+c.server+'</td><td class="'+c.state+'">'+L(c.state)+'</td><td>'+(c.last_heartbeat||'\\u2014')+'</td><td>'+(c.disconnect_reason||'\\u2014')+'</td><td>'+(c.state!=='connecting'?'<button class="btn-connect" onclick="F(\\''+c.server+'\\')">\\u8fde\\u63a5</button>':'\\u8ba4\\u8bc1\\u4e2d...')+'</td></tr><tr id="fm-'+c.server+'" class="hidden"><td colspan="5"><div class="form-row"><input type="password" id="pw-'+c.server+'" placeholder="JumpServer \\u5bc6\\u7801" style="width:180px"><input type="text" id="mf-'+c.server+'" placeholder="MFA \\u9a8c\\u8bc1\\u7801" style="width:120px"><button class="btn-connect" onclick="C(\\''+c.server+'\\')">\\u786e\\u8ba4\\u8fde\\u63a5</button><button class="btn-cancel" onclick="H(\\''+c.server+'\\')">\\u53d6\\u6d88</button></div></td></tr>'}).join('')}function F(s){document.querySelectorAll('[id^=fm-]').forEach(function(e){e.classList.add('hidden')});document.getElementById('fm-'+s).classList.remove('hidden')}function H(s){document.getElementById('fm-'+s).classList.add('hidden')}async function C(s){var p=document.getElementById('pw-'+s).value,m=document.getElementById('mf-'+s).value;if(!p){E('\\u8bf7\\u8f93\\u5165\\u5bc6\\u7801');return}try{var r=await fetch(U,{method:'POST',headers:{Authorization:'Bearer '+T,'Content-Type':'application/json'},body:JSON.stringify({server:s,password:p,mfa_code:m})});var d=await r.json();if(!r.ok)throw new Error(d.detail||'\\u8fde\\u63a5\\u5931\\u8d25');H(s);await R()}catch(e){E(e.message)}}function E(m){var e=document.getElementById('err');e.textContent=m;e.classList.remove('hidden');setTimeout(function(){e.classList.add('hidden')},6000)}R();setInterval(R,10000)</script></body></html>"""
 
 AssetState = Literal["disconnected", "connecting", "connected", "needs_reauth"]
 
@@ -438,6 +445,18 @@ class DashboardConnectRequest(BaseModel):
     server: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=256)
     mfa_code: str = Field(default="", max_length=32)
+
+
+class AllowlistAddRequest(BaseModel):
+    """自定义白名单的新增/更新请求。``name`` 是命令前缀，``denied`` 是该命令仍禁用的 flag。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    denied: list[str] = Field(default_factory=list, max_length=20)
+    note: str = Field(default="", max_length=200)
+
+
+class AllowlistCheckRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=2000)
 
 
 def check_bearer(authorization: str | None = Header(default=None)) -> None:
@@ -994,10 +1013,10 @@ async def execute_system_query(request: SystemQueryRequest, http_request: Reques
 
 @app.get("/dashboard")
 async def dashboard(token: str | None = None) -> HTMLResponse:
-    """Web 仪表盘：访问 /dashboard?token=<local.token> 查看全部资产状态并提交认证凭据。"""
+    """Web 仪表盘：访问 /dashboard?token=<local.token> 查看资产状态、提交认证凭据、维护自定义命令白名单。"""
     if not token or not secrets.compare_digest(token, read_token()):
         return HTMLResponse(LOGIN_HTML)
-    return HTMLResponse(DASHBOARD_HTML.replace("$TOKEN", token))
+    return HTMLResponse(DASHBOARD_HTML.replace("__TOKEN__", json.dumps(token)))
 
 
 @app.get("/dashboard/status")
@@ -1023,6 +1042,62 @@ async def dashboard_connect(
         "mfa_code": body.mfa_code,
     }
     return request.app.state.manager.request_connect(body.server)
+
+
+# ── 自定义命令白名单（网页可增删，逐请求热加载） ──────────────
+
+
+def _allowlist_payload(entries: list[AllowEntry]) -> dict[str, Any]:
+    """统一的白名单响应体：条目 + 文件路径 + 解析警告。"""
+    return {
+        "entries": [entry.to_dict() for entry in entries],
+        "path": str(system_allowlist.current_path()),
+        "warnings": system_allowlist.warnings(),
+        "limits": {"max_entries": system_allowlist.MAX_ENTRIES,
+                   "max_name_length": system_allowlist.MAX_NAME_LEN},
+    }
+
+
+@app.get("/dashboard/allowlist")
+async def dashboard_allowlist(_: None = Depends(check_bearer)) -> dict[str, Any]:
+    """当前生效的自定义系统命令白名单。"""
+    return _allowlist_payload(load_allowlist())
+
+
+@app.post("/dashboard/allowlist")
+async def dashboard_allowlist_add(
+    body: AllowlistAddRequest,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """新增/覆盖一条自定义白名单；写盘后下一次校验立即生效（无需重启）。"""
+    try:
+        entries = add_entry(body.name, denied=body.denied, note=body.note)
+    except AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _allowlist_payload(entries)
+
+
+@app.delete("/dashboard/allowlist")
+async def dashboard_allowlist_delete(
+    name: str,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """删除一条自定义白名单；删除后该命令重新回到 UNKNOWN。"""
+    try:
+        entries = remove_entry(name)
+    except AllowlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _allowlist_payload(entries)
+
+
+@app.post("/dashboard/allowlist/check")
+async def dashboard_allowlist_check(
+    body: AllowlistCheckRequest,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """试运行：用当前生效规则判定一条命令（不发往任何资产），便于登记前确认效果。"""
+    verdict = validate_system_info_command(body.command)
+    return {"verdict": verdict.verdict.value, "message": verdict.message or ""}
 
 
 if __name__ == "__main__":

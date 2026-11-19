@@ -4,6 +4,10 @@
   ALLOWED  ─ 安全命令白名单，自动执行
   REJECTED ─ 明确危险命令或违规语法（重定向/串联/注入），自动拦截
   UNKNOWN  ─ 不在白名单也不在黑名单，提醒用户手动审核
+
+白名单有两层：本文件的内置白名单 + `system_allowlist.py` 提供的
+可在线维护的自定义白名单（网页上增删，请求时热加载）。黑名单与通用语法规则
+始终优先，自定义白名单只能“加白”，不能绕过拦截。
 """
 from __future__ import annotations
 
@@ -18,6 +22,8 @@ from command_guard import (
 )
 from safecmd import CmdSpec
 from safecmd.bashxtract import extract_commands
+
+import system_allowlist
 
 MAX_SEGMENTS = 3
 
@@ -146,12 +152,41 @@ def _match_spec(toks: list[str], specs: set[CmdSpec]) -> int:
         0 = 完全不匹配 → 未知
     """
     for spec in specs:
-        n = len(spec.name)
-        if tuple(toks[:n]) != spec.name:
-            continue
-        if not spec.denied:
+        if _spec_verdict(toks, spec) == 2:
             return 2
-        return 2 if spec(toks) else 1
+    for spec in specs:
+        if _spec_verdict(toks, spec) == 1:
+            return 1
+    return 0
+
+
+def _spec_verdict(toks: list[str], spec: CmdSpec) -> int:
+    """单个 CmdSpec 的匹配结果，语义同 _match_spec（2/1/0）。"""
+    n = len(spec.name)
+    if tuple(toks[:n]) != spec.name:
+        return 0
+    if not spec.denied:
+        return 2
+    return 2 if spec(toks) else 1
+
+
+def _custom_entries() -> list[system_allowlist.AllowEntry]:
+    """读取当前生效的自定义白名单（内部已做 mtime 热加载，异常不影响内置规则）。"""
+    try:
+        return system_allowlist.load_allowlist()
+    except Exception:  # 白名单文件坏了也不能让网关整体失效
+        return []
+
+
+def _match_custom(toks: list[str], entries: list[system_allowlist.AllowEntry]) -> int:
+    """自定义白名单匹配，返回 2/1/0，语义同 _match_spec。"""
+    for entry in entries:
+        verdict = _spec_verdict(toks, CmdSpec(entry.name, denied=set(entry.denied)))
+        if verdict == 2:
+            return 2
+    for entry in entries:
+        if _spec_verdict(toks, CmdSpec(entry.name, denied=set(entry.denied))) == 1:
+            return 1
     return 0
 
 
@@ -204,26 +239,35 @@ def validate_system_info_command(command: str) -> ValidationResult:
         return ValidationResult(Verdict.REJECTED, "Output redirection not allowed.")
 
     # ─ 4. 逐个命令分类 ─
+    custom = _custom_entries()
+    custom_hits: list[str] = []
     for index, toks in enumerate(commands):
         if not toks:
             continue
         cmd_display = " ".join(toks[:2]) if len(toks) > 1 and not toks[1].startswith("-") else toks[0]
 
-        # 4a: 黑名单 → 直接拒绝
+        # 4a: 黑名单 → 直接拒绝（自定义白名单不能覆盖）
         if _match_spec(toks, DENIED_CMDS) > 0:
             return ValidationResult(Verdict.REJECTED,
                 f"Command '{cmd_display}' is blocked for safety.")
 
-        # 4b: 白名单 → 检查匹配级别
-        allowed = _match_spec(toks, ALLOWED_CMDS)
-        if allowed == 1:  # 前缀匹配但被 denied flag 拦截
+        # 4b: 内置白名单优先；只有内置白名单完全不认识时才查自定义白名单
+        builtin_allowed = _match_spec(toks, ALLOWED_CMDS)
+        if builtin_allowed == 1:  # 前缀匹配但被 denied flag 拦截（自定义白名单不放宽内置限制）
             return ValidationResult(Verdict.REJECTED,
                 f"Command '{cmd_display}' uses a forbidden flag.")
-        if allowed == 0:
-            quoted = cmd_display
-            return ValidationResult(Verdict.UNKNOWN,
-                f"Unknown command(s): [{quoted}]. This command will NOT be executed. "
-                "Please review manually and approve if safe.")
+        if builtin_allowed == 0:
+            custom_allowed = _match_custom(toks, custom)
+            if custom_allowed == 1:
+                return ValidationResult(Verdict.REJECTED,
+                    f"Command '{cmd_display}' uses a flag disabled in the custom allowlist.")
+            if custom_allowed == 0:
+                return ValidationResult(Verdict.UNKNOWN,
+                    f"Unknown command(s): [{cmd_display}]. This command will NOT be executed. "
+                    "Please review manually and approve if safe; an admin can register the "
+                    "command prefix in the gateway dashboard's custom allowlist "
+                    "(takes effect on the next request, no restart).")
+            custom_hits.append(cmd_display)
 
         # 4c: 文本处理命令能直接读文件；系统工具无路径白名单，只允许它们接在管道后段
         if index == 0 and toks[0] in PIPE_ONLY_CMDS:
@@ -263,4 +307,7 @@ def validate_system_info_command(command: str) -> ValidationResult:
         if err:
             return ValidationResult(Verdict.REJECTED, err)
 
+    if custom_hits:
+        return ValidationResult(Verdict.ALLOWED,
+            f"Allowed by the custom allowlist: {', '.join(dict.fromkeys(custom_hits))}")
     return ValidationResult(Verdict.ALLOWED)

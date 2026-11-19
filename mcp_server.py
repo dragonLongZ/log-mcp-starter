@@ -352,7 +352,8 @@ async def execute_system_query(
    - systemctl start/stop/restart/enable/disable
    - docker rm/stop/kill/exec/run/build/push
    - kubectl delete/apply/create/edit/patch/scale/exec
-3) 未知 — 不在上述两个名单中的命令：gateway 拒绝执行，返回 UNKNOWN 状态和命令名。此时必须告知用户该命令被识别为未知，让用户来决定是否运行。不要在收到 UNKNOWN 后自行绕过或继续尝试。
+3) 未知 — 不在上述两个名单里的命令：gateway 拒绝执行，返回 UNKNOWN 状态和命令名。此时必须告知用户该命令被识别为未知，让用户来决定是否运行。不要在收到 UNKNOWN 后自行绕过或继续尝试。
+   如果这个命令确实是只读/只查看的，可以建议用户在网关仪表盘（/dashboard）的「自定义命令白名单」里登记该命令前缀（如 'docker compose ls'），保存后下一次请求立即生效、无需重启；登记后仍需遵守下面的通用安全限制。
 
 安全限制（对所有命令生效）：
 - 禁止输出重定向（> / >> / &>）

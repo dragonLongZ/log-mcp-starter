@@ -77,6 +77,34 @@ targets:
 - **黑名单**：rm/mv/cp/dd、sudo/su、reboot/shutdown、chmod/chown、curl/wget/nc/ssh、bash/python、systemctl start/stop、docker rm/exec/run、kubectl delete/apply/exec 等。
 - **额外限制**：grep/head/tail/awk 等只能接在 `|` 之后（不能单独读文件）；`top` 必须带 `-b`；`journalctl` 禁 `-f`；`kubectl get/describe secret(s)` 与 `kubectl config view --raw` 被拒绝（防凭据泄露）；禁止输出重定向、命令串联与 `$(`。
 
+### 自定义命令白名单（网页可维护，实时生效）
+
+内置白名单不可能覆盖所有只读命令（`htop`、`ifconfig`、`docker compose ls`…），遇到 UNKNOWN 时不必改代码：
+
+1. 浏览器打开 `http://<gateway>:8765/dashboard?token=<local.token>`；
+2. 在「自定义命令白名单」里填**命令前缀**（如 `docker compose ls`）→ 点「添加 / 更新」；
+3. 该命令**下一次请求立即放行**，无需重启 gateway；删除后立即恢复 UNKNOWN。
+
+也可用「试运行校验」输入一条完整命令，先看网关会判定成 `allowed` / `rejected` / `unknown`（不发往任何资产）。
+
+存储与接口：
+
+| 项 | 说明 |
+|---|---|
+| 存储 | `config/system_allowlist.yaml`（可手工编辑，改完同样实时生效） |
+| `GET /dashboard/allowlist` | 列出当前条目、文件路径与解析警告 |
+| `POST /dashboard/allowlist` | `{name, denied[], note}` 新增或覆盖一条 |
+| `DELETE /dashboard/allowlist?name=htop` | 删除一条 |
+| `POST /dashboard/allowlist/check` | `{command}` 试运行判定，返回 `{verdict, message}` |
+
+匹配规则与边界（重要）：
+
+- **前缀匹配**：按 token 前缀匹配，登记 `docker compose ls` 只放行以这三个 token 开头的命令；`name` 最多 4 个 token，且不允许 `; & | $ \` > < ( )` 等 shell 元字符。
+- **黑名单优先**：`rm`、`sudo`、`docker rm`、`kubectl delete` 等黑名单命令**不能**被登记，也不能用更短前缀绕过（例如登记 `docker` 会被拒绝，因为它会放行 `docker rm`）。
+- **通用规则始终生效**：禁止输出重定向、命令串联（`; && ||`）、换行与 `$(`/反引号，awk `system()`/`getline`/`print >` 仍被拒绝；管道最多 3 段。
+- **每条可再禁 flag**：登记 `ncdu` 时同时填 `denied: ["-o"]`，则 `ncdu` 放行、`ncdu -o out.txt` 仍被拒绝。
+- 白名单文件损坏不会拖垮网关：坏条目被跳过，并在接口 `warnings` 与页面底部提示。
+
 ## 配套 Skill
 
 `.claude/skills/log-query/SKILL.md` 提供项目级 skill，规范 Claude 的查询流程：连接状态前置检查 → 资产/模块选择（未指明必问、已指明不问）→ 时间与类型澄清 → 意图-工具映射 → 多资产分组汇总 → 只读边界。在本项目目录启动 Claude Code 即自动可用。
