@@ -349,6 +349,22 @@ class TestSettings:
             config_store.load_settings()
         assert not config_store.settings_path().exists()
 
+    def test_bootstrap_survives_utf16_legacy_file(self):
+        """PowerShell `git show > file` 会写成 UTF-16；恢复旧配置后必须仍能解析。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        payload = yaml.safe_dump({"jumpserver": {"host": "from-utf16"}}, allow_unicode=True)
+        legacy.write_bytes(b"\xff\xfe" + payload.encode("utf-16-le"))
+        assert config_store.load_settings()["jumpserver"]["host"] == "from-utf16"
+
+    def test_bootstrap_survives_gbk_legacy_file(self):
+        """老 Windows 编辑的配置可能是 GBK。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        payload = yaml.safe_dump({"jumpserver": {"host": "gbk-host"}}, allow_unicode=True)
+        legacy.write_bytes(payload.encode("gb18030"))
+        assert config_store.load_settings()["jumpserver"]["host"] == "gbk-host"
+
     def test_existing_settings_wins_over_legacy(self):
         """已有 settings.yaml 时绝不能被旧文件覆盖。"""
         config_store.legacy_targets_path().write_text(

@@ -393,6 +393,24 @@ settings.yaml，于是两个服务同时起不来。
 _SETTINGS_KEYS = ("jumpserver", "mcp_server", "log_timezone", "storage", "dashboard")
 
 
+def read_text_lenient(path: Path) -> str:
+    """读取文本配置：兼容 UTF-8 BOM 与 Windows 下常见的 UTF-16 / GBK。
+
+    `git show <rev>:file > file` 在 PowerShell 里会写成 UTF-16，手工编辑也可能
+    存成 GBK；直接用 encoding="utf-8" 读会抛 UnicodeDecodeError，而这个函数
+    被「自动生成设置」的兜底路径调用，绝不能因为编码再崩一次。
+    """
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _settings_candidates() -> list[Path]:
     """可能含部署设置的旧配置文件（按存在性过滤，去重且保持顺序）。"""
     seen: dict[Path, None] = {}
@@ -414,7 +432,7 @@ def bootstrap_settings_from_legacy() -> Path | None:
         return None
     for candidate in _settings_candidates():
         try:
-            raw = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            raw = yaml.safe_load(read_text_lenient(candidate)) or {}
         except (OSError, yaml.YAMLError):
             continue
         if not isinstance(raw, dict) or "jumpserver" not in raw:
