@@ -171,6 +171,14 @@ class TestLegacyMigration:
         assert not legacy.exists()
         assert legacy.with_name(legacy.name + ".migrated").exists()
 
+    def test_migration_survives_utf16_legacy_file(self):
+        """恢复旧配置时若用了 PowerShell 重定向（UTF-16），资产迁移也必须能读。"""
+        legacy = config_store.legacy_targets_path()
+        payload = yaml.safe_dump({"targets": {"srv-utf16": make_target()}}, allow_unicode=True)
+        legacy.write_bytes(b"\xff\xfe" + payload.encode("utf-16-le"))
+        config_store.init_db()
+        assert "srv-utf16" in config_store.load_config()["targets"]
+
     def test_migration_is_idempotent(self):
         legacy = config_store.legacy_targets_path()
         legacy.write_text(

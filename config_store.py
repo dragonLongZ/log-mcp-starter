@@ -848,7 +848,7 @@ def from_legacy_yaml(force: bool = False) -> int:
         imported = 0
         if path.exists():
             try:
-                raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                raw = yaml.safe_load(read_text_lenient(path)) or {}
             except (OSError, yaml.YAMLError):
                 raw = {}
             targets = raw.get("targets") if isinstance(raw, dict) else None
