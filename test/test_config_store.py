@@ -272,6 +272,15 @@ class TestLegacyAllowlistMigration:
 
 
 class TestSettings:
+    @staticmethod
+    def _drop_settings() -> None:
+        """模拟「老部署 pull 完新代码」：settings.yaml 不存在。
+
+        conftest 会为每个用例预置一份可用的 settings.yaml，这里显式删掉才能
+        走到「自动从旧配置生成」的分支。
+        """
+        config_store.settings_path().unlink(missing_ok=True)
+
     def test_missing_settings_gives_copy_hint(self):
         """settings.yaml 不进版本库，首次使用必须先复制示例：报错要能指导这一步。"""
         config_store.set_paths(settings=config_store.db_path().parent / "nope.yaml")
@@ -281,6 +290,73 @@ class TestSettings:
         assert "settings.example.yaml" in message
         assert "cp " in message
         assert "jumpserver.host" in message
+
+    # ── 升级路径回归：老部署 pull 新代码后 settings.yaml 不存在 ──
+    def test_bootstrap_from_legacy_targets(self):
+        """旧 log_targets.yaml 还在时，应自动生成 settings.yaml 而不是崩掉。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        legacy.write_text(
+            yaml.safe_dump({
+                "jumpserver": {"host": "jump.internal", "port": 2222,
+                               "bind_host": "0.0.0.0", "bind_port": 8765,
+                               "auto_connect": [], "keepalive_interval_minutes": 25},
+                "mcp_server": {"bind_host": "0.0.0.0", "bind_port": 8000},
+                "log_timezone": "Asia/Shanghai",
+                "targets": {"srv-a": make_target()},
+            }, allow_unicode=True),
+            encoding="utf-8",
+        )
+        settings = config_store.load_settings()
+        assert settings["jumpserver"]["host"] == "jump.internal"
+        assert settings["jumpserver"]["bind_host"] == "0.0.0.0"
+        assert settings["mcp_server"]["bind_port"] == 8000
+        assert config_store.settings_path().exists()
+        # targets 段不应被抄进 settings.yaml（资产走 DB 迁移）
+        written = yaml.safe_load(config_store.settings_path().read_text(encoding="utf-8"))
+        assert "targets" not in written
+
+    def test_bootstrap_from_migrated_file(self):
+        """迁移后原文件被重命名为 .migrated，也要能找到。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        migrated = legacy.with_name(legacy.name + ".migrated")
+        migrated.write_text(
+            yaml.safe_dump({"jumpserver": {"host": "from-migrated"}}, allow_unicode=True),
+            encoding="utf-8",
+        )
+        settings = config_store.load_settings()
+        assert settings["jumpserver"]["host"] == "from-migrated"
+
+    def test_bootstrap_writes_posix_db_path(self):
+        """生成的 db_path 用正斜杠，配置可能被复制到 Linux。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        legacy.write_text(
+            yaml.safe_dump({"jumpserver": {"host": "h"}}, allow_unicode=True), encoding="utf-8"
+        )
+        config_store.load_settings()
+        text = config_store.settings_path().read_text(encoding="utf-8")
+        assert "data/logmcp.db" in text
+        assert "data\\logmcp.db" not in text
+
+    def test_bootstrap_ignores_unusable_legacy(self):
+        """旧文件坏了就正常报错，不要写出半个 settings.yaml。"""
+        self._drop_settings()
+        legacy = config_store.legacy_targets_path()
+        legacy.write_text("not: [valid", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="settings.example.yaml"):
+            config_store.load_settings()
+        assert not config_store.settings_path().exists()
+
+    def test_existing_settings_wins_over_legacy(self):
+        """已有 settings.yaml 时绝不能被旧文件覆盖。"""
+        config_store.legacy_targets_path().write_text(
+            yaml.safe_dump({"jumpserver": {"host": "legacy-value"}}, allow_unicode=True),
+            encoding="utf-8",
+        )
+        # 不删除 conftest 预置的 settings.yaml，验证它没被覆盖
+        assert config_store.load_settings()["jumpserver"]["host"] != "legacy-value"
 
     def test_example_settings_is_valid_and_has_no_internal_host(self):
         """示例文件必须能直接跑，且不能泄露真实内网域名。"""

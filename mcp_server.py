@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 import secrets as _secrets
 import httpx
-import yaml
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -12,8 +11,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
 
+import config_store
+
 ROOT = Path(__file__).resolve().parent
-SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 TOKEN_PATH = ROOT / "local.token"
 LogType = Literal["info", "error", "both"]
 MAX_SERVERS_PER_QUERY = 10
@@ -24,9 +24,11 @@ def load_config() -> dict[str, Any]:
 
     MCP 进程只需要 jumpserver.bind_port / mcp_server.bind_*，不需要资产清单，
     因此这里**不**打开 SQLite —— 资产数据只由 gateway 一个进程写。
+
+    复用 config_store.load_settings()：settings.yaml 缺失时会先尝试从旧的
+    log_targets.yaml 自动生成，而不是让进程在导入期直接崩掉。
     """
-    with SETTINGS_PATH.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    return config_store.load_settings()
 
 
 def bridge_settings() -> tuple[str, str]:

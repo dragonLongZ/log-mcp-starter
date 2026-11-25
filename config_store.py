@@ -380,15 +380,86 @@ def validate_target(name: Any, target: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 读：settings.yaml + DB → 旧版 dict 形状
 # ---------------------------------------------------------------------------
-def load_settings() -> dict[str, Any]:
-    """读取部署设置；缺失时给出「复制示例文件」的可操作提示。"""
+"""从旧版资产配置里提取部署设置段，自动生成 settings.yaml。
+
+背景（真实踩坑）：把 log_targets.yaml 移出版本库后，已部署的机器 `git pull` 会
+把该文件删掉，而它同时承载「部署设置」和「资产」两类数据。新代码只读
+settings.yaml，于是两个服务同时起不来。
+
+因此 settings.yaml 缺失时不再直接报错：如果同目录还有旧 log_targets.yaml
+（或它的 .migrated 备份），就从中把部署设置段抽出来写一份 settings.yaml。
+这样老部署 pull 完新代码能直接起来，不需要人工拼配置。
+"""
+_SETTINGS_KEYS = ("jumpserver", "mcp_server", "log_timezone", "storage", "dashboard")
+
+
+def _settings_candidates() -> list[Path]:
+    """可能含部署设置的旧配置文件（按存在性过滤，去重且保持顺序）。"""
+    seen: dict[Path, None] = {}
+    for base in (legacy_targets_path(), settings_path().parent / LEGACY_TARGETS_PATH.name):
+        for candidate in (base, base.with_name(base.name + ".migrated")):
+            if candidate.exists():
+                seen.setdefault(candidate, None)
+    return list(seen)
+
+
+def bootstrap_settings_from_legacy() -> Path | None:
+    """从旧配置文件生成 settings.yaml；成功返回写入路径，无可用来源返回 None。
+
+    只抽取部署设置段（jumpserver / mcp_server / log_timezone / storage / dashboard），
+    targets 段留给 init_db 的资产迁移处理，两边互不干扰。
+    """
     path = settings_path()
+    if path.exists():
+        return None
+    for candidate in _settings_candidates():
+        try:
+            raw = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, dict) or "jumpserver" not in raw:
+            continue
+        extracted = {key: raw[key] for key in _SETTINGS_KEYS if key in raw}
+        # 用正斜杠：settings.yaml 可能被复制到 Linux 服务器，反斜杠在 POSIX 下不是分隔符。
+        extracted.setdefault("storage", {"db_path": "data/logmcp.db"})
+        extracted.setdefault("dashboard", {"write_enabled": True})
+        header = (
+            "# 部署设置 —— 由 config_store 从旧配置文件自动生成。\n"
+            f"# 来源：{candidate}\n"
+            "# 可手工编辑；资产与命令白名单在运行时数据库里，由网页 /dashboard 维护。\n"
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                header + yaml.safe_dump(extracted, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"[warn] 无法自动生成 {path}：{exc}")
+            return None
+        print(
+            f"[info] 已从 {candidate.name} 自动生成 {path.name}（抽取 "
+            f"{', '.join(extracted)}）。如需调整请直接编辑该文件。"
+        )
+        return path
+    return None
+
+
+def load_settings() -> dict[str, Any]:
+    """读取部署设置；缺失时先尝试从旧配置生成，再给可操作提示。"""
+    path = settings_path()
+    if not path.exists():
+        generated = bootstrap_settings_from_legacy()
+        if generated is not None:
+            path = generated
     if not path.exists():
         raise RuntimeError(
             f"缺少部署设置文件 {path}。\n"
             "首次使用请先复制示例并按需修改：\n"
             f"    cp {EXAMPLE_SETTINGS_PATH} {path}\n"
-            "至少需要 jumpserver.host；其余（bind_*、keepalive、log_timezone、storage）可沿用示例值。"
+            "至少需要 jumpserver.host；其余（bind_*、keepalive、log_timezone、storage）可沿用示例值。\n"
+            "（如果是从旧版本升级：把原来的 config/log_targets.yaml 放回 config/ 目录，"
+            "本程序会自动从中生成 settings.yaml。）"
         )
     with path.open("r", encoding="utf-8") as handle:
         settings = yaml.safe_load(handle) or {}
