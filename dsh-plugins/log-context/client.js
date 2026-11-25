@@ -236,6 +236,13 @@ window.__ModuleLoader__.load({
       const [podOptions, setPodOptions] = React.useState([])
       const [busy, setBusy] = React.useState('')
       const [notice, setNotice] = React.useState('')
+      // 连接设置：默认折叠，避免挡住日常选择资产的流程。
+      const [connOpen, setConnOpen] = React.useState(false)
+      const [connForm, setConnForm] = React.useState({ gatewayBaseUrl: '', mcpUrl: '', token: '' })
+      const [connTesting, setConnTesting] = React.useState('')
+      const [connNotice, setConnNotice] = React.useState('')
+      // MCP 端点探活结果：用来区分「地址/token 不对」与「只是客户端没注册工具」。
+      const [mcpProbe, setMcpProbe] = React.useState(null)
 
       React.useEffect(() => {
         const controller = new AbortController()
@@ -267,6 +274,7 @@ window.__ModuleLoader__.load({
 
       const assets = (catalog && catalog.assets) || []
       const environments = (catalog && catalog.environments) || []
+      const connection = (catalog && catalog.connection) || null
       const asset = assets.find((item) => item.key === assetKey) || null
       const templates = asset && asset.kind === 'k8s' ? K8S_TEMPLATES : LINUX_TEMPLATES
       const template = templates.find((item) => item.id === templateId) || templates[0]
@@ -296,6 +304,16 @@ window.__ModuleLoader__.load({
         if (!assetKey) return
         savePrefs({ assetKey, moduleName, templateId, day, namespace })
       }, [assetKey, moduleName, templateId, day, namespace])
+
+      // 首次拿到连接信息（或后端值变化）时同步到表单；token 永远留空由用户重填。
+      React.useEffect(() => {
+        if (!connection) return
+        setConnForm((current) => ({
+          gatewayBaseUrl: current.gatewayBaseUrl || connection.gatewayBaseUrl || '',
+          mcpUrl: current.mcpUrl || connection.mcpUrl || '',
+          token: '',
+        }))
+      }, [connection && connection.gatewayBaseUrl, connection && connection.mcpUrl])
 
       const visibleAssets = assets.filter((item) => {
         if (envFilter !== 'all' && item.envId !== envFilter) return false
@@ -383,6 +401,83 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy('')
           window.setTimeout(() => setRefreshTick((tick) => tick + 1), 1500)
+        }
+      }
+
+      /** MCP 未就绪时自动探活一次，把「地址填错」和「只是没注册」区分开。 */
+      React.useEffect(() => {
+        const notReady = catalog && catalog.mcp && catalog.mcp.ready === false
+        if (!notReady) {
+          setMcpProbe(null)
+          return undefined
+        }
+        let alive = true
+        callApi('mcp.probe', {})
+          .then((value) => {
+            if (alive) setMcpProbe(value)
+          })
+          .catch((failure) => {
+            if (!alive) return
+            setMcpProbe({ ok: false, message: failure.message || String(failure) })
+          })
+        return () => {
+          alive = false
+        }
+      }, [catalog && catalog.mcp && catalog.mcp.ready, refreshTick])
+
+      /** 手动测试 MCP 端点（保存前也可用）。 */
+      async function handleProbeMcp() {
+        setBusy('正在测试 MCP 端点…')
+        try {
+          const result = await callApi('mcp.probe', {})
+          setMcpProbe(result)
+          setNotice(`${result.ok ? '✅ ' : '❌ '}${result.message}`)
+        } catch (failure) {
+          setNotice(`❌ ${failure.message || String(failure)}`)
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** 试连当前表单里的地址与 token（不保存）。gateway 与 MCP 都会测。 */
+      async function handleTestConnection() {
+        setConnTesting('正在试连…')
+        setConnNotice('')
+        try {
+          const result = await callApi('settings.test', {
+            gatewayBaseUrl: connForm.gatewayBaseUrl,
+            mcpUrl: connForm.mcpUrl,
+            token: connForm.token,
+          })
+          setConnNotice(`${result.ok ? '✅ ' : '❌ '}${result.message}`)
+        } catch (failure) {
+          setConnNotice(`❌ ${failure.message || String(failure)}`)
+        } finally {
+          setConnTesting('')
+        }
+      }
+
+      /** 保存连接设置；Host 半保存后会重启 MCP 行让新地址生效。 */
+      async function handleSaveConnection() {
+        setConnTesting('正在保存…')
+        setConnNotice('')
+        try {
+          const saved = await callApi('settings.save', {
+            gatewayBaseUrl: connForm.gatewayBaseUrl,
+            mcpUrl: connForm.mcpUrl,
+            token: connForm.token,
+          })
+          const mcpOk = saved && saved.mcp && saved.mcp.readyAfter
+          setConnForm((current) => ({ ...current, token: '' }))
+          setConnNotice(
+            `✅ 已保存到 ${saved.settingsFile}`
+            + (mcpOk ? `，MCP 已重连（${saved.mcp.toolCount} 个工具）` : '，MCP 未就绪，可点上方「重连 MCP」再试'),
+          )
+          setRefreshTick((tick) => tick + 1)
+        } catch (failure) {
+          setConnNotice(`❌ ${failure.message || String(failure)}`)
+        } finally {
+          setConnTesting('')
         }
       }
 
@@ -477,11 +572,34 @@ window.__ModuleLoader__.load({
             ? h(
                 'div',
                 { className: 'lc-warn' },
-                h('span', { className: 'lc-warn-text' }, 'MCP 工具未就绪：模型暂时查不了日志（常见于启动时 VPN/网络未就绪）。'),
                 h(
-                  'button',
-                  { type: 'button', className: 'lc-icon-btn', disabled: busy !== '', onClick: handleRestartMcp },
-                  '重连 MCP',
+                  'div',
+                  { className: 'lc-warn-text' },
+                  h('div', null, 'MCP 工具未就绪：模型暂时查不了日志。'),
+                  // 把实际连接目标显示出来：地址填错时一眼能看出（最常见的失败原因）
+                  connection && connection.mcpUrl
+                    ? h('div', { className: 'lc-hint' }, `连接目标：${connection.mcpUrl}`)
+                    : null,
+                  mcpProbe && mcpProbe.ok === false
+                    ? h('div', { className: 'lc-hint' }, `探活失败：${mcpProbe.message}`)
+                    : null,
+                  mcpProbe && mcpProbe.ok
+                    ? h('div', { className: 'lc-hint' }, `端点可达（${mcpProbe.message}），但客户端未注册工具，试试点「重连 MCP」。`)
+                    : null,
+                ),
+                h(
+                  'div',
+                  { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
+                  h(
+                    'button',
+                    { type: 'button', className: 'lc-icon-btn', disabled: busy !== '', onClick: handleRestartMcp },
+                    '重连 MCP',
+                  ),
+                  h(
+                    'button',
+                    { type: 'button', className: 'lc-icon-btn', disabled: busy !== '', onClick: handleProbeMcp, title: '直接向 MCP 地址发一次 initialize 握手，验证地址与 token' },
+                    '测试端点',
+                  ),
                 ),
               )
             : null,
@@ -498,6 +616,82 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
+
+          // 连接设置：地址与 token 都在这里配，不再需要改 patch 文件
+          h(
+            'div',
+            { className: 'lc-group' },
+            h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+              h('span', { className: 'lc-label', style: { flex: '1' } }, '连接设置'),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'lc-icon-btn',
+                  title: connection ? `设置文件：${connection.settingsFile}` : '配置网关地址与访问令牌',
+                  onClick: () => setConnOpen((open) => !open),
+                },
+                connOpen ? '收起' : '配置',
+              ),
+            ),
+            connOpen
+              ? h(
+                  'div',
+                  { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+                  h('input', {
+                    className: 'lc-input',
+                    placeholder: '网关地址，如 http://10.12.0.101:8765',
+                    value: connForm.gatewayBaseUrl,
+                    onChange: (event) => setConnForm((current) => ({ ...current, gatewayBaseUrl: event.target.value })),
+                  }),
+                  h('input', {
+                    className: 'lc-input',
+                    placeholder: 'MCP 地址，如 http://10.12.0.101:8000/mcp',
+                    value: connForm.mcpUrl,
+                    onChange: (event) => setConnForm((current) => ({ ...current, mcpUrl: event.target.value })),
+                  }),
+                  h('input', {
+                    className: 'lc-input',
+                    type: 'password',
+                    placeholder: connection && connection.hasToken
+                      ? `访问令牌（已设置 ${connection.tokenMasked}，留空则保持不变）`
+                      : '访问令牌（local.token 的内容）',
+                    value: connForm.token,
+                    onChange: (event) => setConnForm((current) => ({ ...current, token: event.target.value })),
+                  }),
+                  h(
+                    'div',
+                    { className: 'lc-actions' },
+                    h(
+                      'button',
+                      { type: 'button', className: 'lc-btn', disabled: connTesting !== '', onClick: handleTestConnection },
+                      '试连',
+                    ),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'lc-btn',
+                        'data-primary': 'true',
+                        disabled: connTesting !== '',
+                        onClick: handleSaveConnection,
+                      },
+                      '保存',
+                    ),
+                  ),
+                  h('span', { className: 'lc-hint' }, busy || connTesting || connNotice
+                    || (connection && connection.settingsFile ? `保存位置：${connection.settingsFile}` : '')),
+                )
+              : h(
+                  'span',
+                  { className: 'lc-hint' },
+                  connection
+                    ? `${connection.gatewayBaseUrl}${connection.hasToken ? ' · 令牌已设置' : ' · 未设置令牌'}`
+                    : '未读取到连接信息',
+                ),
+          ),
 
           // 环境筛选
           h(

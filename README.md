@@ -12,35 +12,45 @@
 
 ## 配置
 
-`config/log_targets.yaml`：每个资产携带自己的 `ssh_username`，每个模块只需 `log_dir`。
+配置分成**两处**，边界清晰：
+
+| 文件 | 内容 | 维护方式 | 进版本库 |
+|---|---|---|---|
+| `config/settings.yaml` | 部署设置：JumpServer 地址/端口、监听地址、心跳间隔、日志时区、DB 路径、网页写开关 | 手工编辑，改完重启 gateway | ❌（含内部域名，已 gitignore） |
+| `data/logmcp.db` | 运行期数据：资产、模块、自定义命令白名单、审计 | **网页仪表盘 `/dashboard` 增删改** | ❌（已 gitignore） |
+
+仓库里只有 `config/settings.example.yaml` 与 `config/log_targets.example.yaml` 两个示例。**首次使用先复制**：
+
+```bash
+cp config/settings.example.yaml config/settings.yaml
+# 然后按需修改 host / bind_* / storage.db_path
+```
 
 ```yaml
+# config/settings.yaml
 jumpserver:
   host: "jumpserver.example.com"
   port: 2222
-  bind_host: "127.0.0.1"
+  bind_host: "0.0.0.0"          # 只给本机用就写 127.0.0.1
   bind_port: 8765
-  auto_connect: []                # 可选：启动时自动认证的资产列表
-  keepalive_interval_minutes: 25  # 可选：应用层心跳间隔（1-60）
-
+  auto_connect: []              # 可选：启动时自动认证的资产
+  keepalive_interval_minutes: 25
+mcp_server:
+  bind_host: "0.0.0.0"
+  bind_port: 8000
 log_timezone: "Asia/Shanghai"
-
-targets:
-  server-172-26-73-80:
-    description: "Linux asset 172.26.73.80"
-    ssh_username: "zhangxiaolong#root#172.26.73.80"
-    modules:
-      member:
-        log_dir: "/data/logs/parking/member"
-  server-172-26-73-81:
-    description: "Linux asset 172.26.73.81"
-    ssh_username: "zhangxiaolong#root#172.26.73.81"
-    modules:
-      order-api:
-        log_dir: "/data/apps/order-api/logs"
+storage:
+  db_path: "data/logmcp.db"     # systemd 建议写 /var/lib/logmcp/logmcp.db
+dashboard:
+  write_enabled: true           # 关掉后网页只能看状态
 ```
 
-**从旧版迁移**（BREAKING）：删除 `jumpserver.username` 与 `jumpserver.active_target`，把用户名移到每个 target 的 `ssh_username` 字段。路径必须是目标机器上的绝对路径且位于该资产授权范围内。
+**为什么 DB 而不是 YAML**：网页要支持增/改/删，整文件重写既会吃掉注释，也会让两个标签页互相覆盖；SQLite 提供行级校验（一条脏数据只跳过它自己，不会让整个网关 500）、事务、审计，而 `sqlite3` 是标准库、零新增依赖。开源仓库只需 gitignore 一个数据库文件。
+
+**从旧版迁移**（BREAKING）：首次启动会自动把旧的 `config/log_targets.yaml` 与 `config/system_allowlist.yaml` 导入数据库，并重命名为 `.migrated` 保留备份。迁移是幂等的，重复启动不会覆盖你后来的修改。回滚方式：仪表盘「导出」→ 把内容存回 `config/log_targets.yaml` → 回退代码版本。
+
+> 注意：`config/log_targets.yaml`、`.bak`、`.migrated` 也已 gitignore——它们含真实内网 IP 与 JumpServer 用户名，属于本机数据。开源仓库里只有 `.example.yaml`。
+
 
 ## MCP 工具
 
@@ -91,8 +101,8 @@ targets:
 
 | 项 | 说明 |
 |---|---|
-| 存储 | `config/system_allowlist.yaml`（可手工编辑，改完同样实时生效） |
-| `GET /dashboard/allowlist` | 列出当前条目、文件路径与解析警告 |
+| 存储 | 与资产同一个 SQLite 库的 `allowlist_entries` 表（不再是独立 YAML） |
+| `GET /dashboard/allowlist` | 列出当前条目、数据库路径与解析警告 |
 | `POST /dashboard/allowlist` | `{name, denied[], note}` 新增或覆盖一条；`denied` 可填 flag 或子命令 |
 | `DELETE /dashboard/allowlist?name=htop` | 删除一条 |
 | `POST /dashboard/allowlist/check` | `{command}` 试运行判定，返回 `{verdict, message}` |
@@ -107,6 +117,32 @@ targets:
   `jcmd 1234 GC.run` 仍被拒绝；登记 `ncdu` 且禁用 `-o`，则 `ncdu` 放行、`ncdu -o out.txt` 仍被拒绝。
 - 白名单文件损坏不会拖垮网关：坏条目被跳过，并在接口 `warnings` 与页面底部提示。
 
+## 网页维护资产
+
+浏览器打开 `http://<gateway>:8765/dashboard?token=<local.token>`，「资产配置」面板可以：
+
+- **新增 / 编辑资产**：填资产名、环境、`ssh_username`、模块与 `log_dir`；保存后**立即生效**，不用重启、不用手工改文件。
+  新资产马上出现在上方状态表，可以直接点「连接」填密码/MFA。
+- **以现有资产为模板**：把某个资产的用户名与全部模块一起填进表单，同一套模块的机器只改资产名和用户名。
+- **停用 / 删除**：停用后从连接池消失但数据保留；删除会关闭其 SSH 连接。
+- **批量导入 / 导出**：导入支持 YAML/JSON（先「试运行」看哪些条目被拒）；导出可下载合并后的完整配置，用于备份或迁移到别的机器。
+
+接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/dashboard/targets` | 资产清单 + 连接状态 + 数据库路径 + 配置告警 |
+| `POST` | `/dashboard/targets` | 新增/整条覆盖（校验失败返回 400，原配置不动） |
+| `DELETE` | `/dashboard/targets?name=` | 删除资产及其模块 |
+| `POST` | `/dashboard/targets/enabled` | `{name, enabled}` 启用/停用 |
+| `POST` | `/dashboard/targets/validate` | 干跑校验，不落库 |
+| `POST` | `/dashboard/targets/import` | `{content, dry_run}` 批量导入 |
+| `GET` | `/dashboard/targets/export?token=` | 导出完整 YAML |
+
+写入前会统一校验：资产名仅限字母数字与 `. _ -`；`log_dir` 必须是绝对路径且不含 `..`；`ssh_username` 允许 `user#role#ip` 里的 `#`。写入使用临时文件 + 显式事务，失败时原数据库保持不变。
+
+> 安全提示：`bind_host: 0.0.0.0` + token 走 URL query 时，拿到 token 等于能登记任意 `ssh_username`/`log_dir`。对外暴露前请把 `dashboard.write_enabled` 设为 `false`，或至少限制来源网段。密码/MFA **不会**入库，只存在于内存中的待认证凭据里，用完即清。
+
 ## 配套 Skill
 
 `.claude/skills/log-query/SKILL.md` 提供项目级 skill，规范 Claude 的查询流程：连接状态前置检查 → 资产/模块选择（未指明必问、已指明不问）→ 时间与类型澄清 → 意图-工具映射 → 多资产分组汇总 → 只读边界。在本项目目录启动 Claude Code 即自动可用。
@@ -120,8 +156,7 @@ targets:
 
 1. **能力**：bundle patch 插入 `@deepseek-ai/dsh-mcp-client`，连本项目的 `mcp_server.py`，
    模型拿到 `mcp__logmcp__*` 工具；并追加一段系统提示，看到「【日志上下文】」块就直接按块内坐标查询。
-2. **交互**：Host 半读 `config/log_targets.yaml` 并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页
-   与输入框左侧入口按钮。
+2. **交互**：Host 半读 gateway `/targets`（本地 `config/log_targets.yaml` 仅作可选补充，缺失时自动降级）并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页与输入框左侧入口按钮。
 
 安装（DSH 会话里执行）：
 
@@ -130,9 +165,9 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
 ```
 
 部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `10.12.0.101`（8000 = MCP，8765 = gateway），
-Windows 本机只跑 DSH。插件用的 token 在 `dsh-plugins/log-context/.token`（已被 `.gitignore` 忽略），
-内容是该服务器上的 `local.token` —— 注意仓库根目录的 `local.token` 可能是本机旧 token，两者不一定相同。
-地址与 token 换机器时改 `dsh-plugins/log-context/cordis.patch.yml` 里的 `url`、`gatewayBaseUrl` 与 `.token`。
+Windows 本机只跑 DSH。**地址与 token 在 DSH 右栏「日志上下文」→「连接设置」里填**，保存在
+`$DSH_HOME/log-context/settings.json`（默认 `~/.dsh/log-context/settings.json`），不进 git、也不用改文件。
+`cordis.patch.yml` 里的 `url` / `gatewayBaseUrl` 只是出厂默认值，设置文件缺失时才生效。
 
 ## 部署模式
 
@@ -179,8 +214,9 @@ WantedBy=multi-user.target
 systemctl daemon-reload && systemctl enable --now log-mcp-gateway
 ```
 
-3. **Web 仪表盘认证**
+3. **Web 仪表盘**
    浏览器打开 `http://<服务器IP>:8765/dashboard?token=<local.token 内容>`，在表格中为每个资产填入 JumpServer 密码 + MFA 验证码，点击连接。连接成功后关闭浏览器即可——gateway 由 systemd 托管，SSH 由心跳任务维持。
+   同一页面的「资产配置」面板可直接新增/编辑/删除资产（存入 `data/logmcp.db`，立即生效）。systemd 部署建议把 `storage.db_path` 指向 `/var/lib/logmcp/logmcp.db`，并在 unit 里加 `StateDirectory=logmcp` 保证目录可写。
 
 4. **启动 MCP 远程服务**
 ```bash
@@ -205,7 +241,8 @@ MCP 以 stdio 与 Claude Code 通信（`claude-mcp.example.json` 方案 B）。
 
 ## 安全边界及当前限制
 
-- 只允许操作配置文件中登记的资产/模块；模型不能传原始 SSH 命令，`execute_query` 的命令经白名单校验，路径限定在 `log_dir` 内。
+- 只允许操作数据库中登记的资产/模块；模型不能传原始 SSH 命令，`execute_query` 的命令经白名单校验，路径限定在 `log_dir` 内。
+- 资产与白名单的变化都会写入 `audit_log` 表（谁在什么时候加了哪台机器）；密码/MFA 不入库。
 - 远程发现范围限制在 `log_dir` 下最多 5 层、最多 2000 个文件；查询最多使用 50 个文件。
 - 压缩文件（.gz 等）会出现在发现列表中，`search_logs`/`read_log_tail` 不搜索压缩文件；用 `execute_query` 的 zgrep/zcat 查询。
 - 日期识别覆盖常见文件名格式；非常规名称用 `discover_log_files` 让模型读取候选清单后以 `file_ids` 指定。

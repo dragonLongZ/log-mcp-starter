@@ -14,6 +14,15 @@ import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import {
+  maskToken,
+  normalizeUrl,
+  readSettings,
+  resolveSettings as resolveConnectionSettings,
+  settingsPath,
+  writeSettings,
+} from './settings.js'
+
 /** Loader 行 id 与展示名。 */
 export const name = 'log-context'
 
@@ -29,6 +38,8 @@ const DEFAULT_TOKEN_FILE = 'local.token'
 const DEFAULT_GATEWAY_PORT = 8765
 const DEFAULT_MCP_PORT = 8000
 const GATEWAY_TIMEOUT_MS = 3000
+/** MCP initialize 握手超时：比 gateway 宽松些，跨机器 RTT 可能较大。 */
+const MCP_PROBE_TIMEOUT_MS = 6000
 const MAX_BODY_BYTES = 1 << 20
 
 // ─────────────────────────── 极简 YAML 解析 ───────────────────────────
@@ -350,27 +361,36 @@ function buildCatalog(entries) {
   return { assets, environments }
 }
 
-/** 解析运行参数，全部来自 bundle 行 config，缺省值指向当前项目。 */
-function resolveSettings(config) {
-  const raw = config && typeof config === 'object' ? config : {}
-  const projectDir = raw.projectDir ? String(raw.projectDir) : DEFAULT_PROJECT_DIR
-  const tokenPath = raw.tokenPath ? String(raw.tokenPath) : join(projectDir, DEFAULT_TOKEN_FILE)
-  return {
-    projectDir,
-    tokenPath,
-    gatewayBaseUrl: raw.gatewayBaseUrl ? String(raw.gatewayBaseUrl) : `http://127.0.0.1:${DEFAULT_GATEWAY_PORT}`,
-    mcpPort: DEFAULT_MCP_PORT,
+/**
+ * 解析运行参数，来源优先级：用户保存的设置 > bundle 行 config > 默认值。
+ * 用户可以在右栏「连接设置」里改地址与 token，不必再编辑 patch 文件。
+ *
+ * @param config - bundle 行 config。
+ * @param testConfigFile - 仅测试用：覆盖设置文件路径。
+ */
+function resolveSettings(config, testConfigFile) {
+  const resolved = resolveConnectionSettings(config, testConfigFile ? { file: testConfigFile } : {})
+  // patch 里没有 projectDir 时回落到插件所在项目根，保证本地 YAML 兜底仍可用。
+  if (!resolved.projectDir) {
+    resolved.projectDir = DEFAULT_PROJECT_DIR
+    if (!resolved.tokenPath) resolved.tokenPath = join(DEFAULT_PROJECT_DIR, DEFAULT_TOKEN_FILE)
   }
+  return resolved
 }
 
-/** 读取本地 bearer token；缺失时给出可操作错误。 */
+/** 读取本地 bearer token：优先用户保存的设置，其次回退到文件。 */
 function readToken(settings) {
+  if (settings.token) return settings.token
   try {
     const token = readFileSync(settings.tokenPath, 'utf8').trim()
     if (!token) throw new Error('token 文件为空')
     return token
   } catch (error) {
-    const failure = new Error(`无法读取 ${settings.tokenPath}：${error.message}。请先在项目里运行 \`uv run python create_token.py\`。`)
+    const failure = new Error(
+      `尚未设置访问令牌：请在右栏「日志上下文」→「连接设置」里填写 gateway 地址与 token`
+      + (settings.tokenPath ? `（也可把 token 写入 ${settings.tokenPath}）` : '')
+      + `。原始错误：${error.message}`,
+    )
     failure.code = 'token-missing'
     throw failure
   }
@@ -422,6 +442,84 @@ async function gatewayRequest(settings, method, path, body) {
   }
 }
 
+/**
+ * 探测 MCP 端点是否真的能握手（streamable HTTP 的 initialize 请求）。
+ *
+ * 为什么需要：`mcpStatus` 只能看到「工具有没有注册」，看不出「连的是不是错的地址」。
+ * 用户把 mcpUrl 填成 127.0.0.1 而后端在别的机器上时，重连永远失败且看不出原因。
+ *
+ * @returns `{ ok, url, message, toolCount? }`，不抛错。
+ */
+async function probeMcp(settings) {
+  const url = String(settings.mcpUrl || '')
+  if (!url) return { ok: false, url, message: '未配置 MCP 地址' }
+  let token = ''
+  try {
+    token = readToken(settings)
+  } catch (error) {
+    return { ok: false, url, message: error.message }
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), MCP_PROBE_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'dsh-log-context-probe', version: '1' },
+        },
+      }),
+      signal: controller.signal,
+    })
+    const text = await response.text()
+    if (response.status === 401) {
+      return { ok: false, url, message: `MCP 鉴权失败（401）：token 与该服务不匹配` }
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        url,
+        message: `MCP 返回 HTTP ${response.status}${text ? `：${text.slice(0, 200)}` : ''}`,
+      }
+    }
+    // 成功时是 SSE（event: message / data: {...}），取出 jsonrpc 结果判断。
+    const payload = text.includes('data:') ? text.slice(text.indexOf('data:') + 5) : text
+    let parsed = null
+    try {
+      parsed = JSON.parse(payload.trim())
+    } catch {
+      parsed = null
+    }
+    if (parsed && parsed.error) {
+      return { ok: false, url, message: `MCP 拒绝握手：${parsed.error.message || JSON.stringify(parsed.error)}` }
+    }
+    const serverName = parsed?.result?.serverInfo?.name ?? ''
+    const version = parsed?.result?.serverInfo?.version ?? ''
+    return {
+      ok: true,
+      url,
+      message: `MCP 握手成功${serverName ? `：${serverName}${version ? ` ${version}` : ''}` : ''}`,
+    }
+  } catch (error) {
+    const reason = error.name === 'AbortError'
+      ? `超时（${MCP_PROBE_TIMEOUT_MS}ms）`
+      : error.message
+    return { ok: false, url, message: `无法连接 MCP（${url}）：${reason}` }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** 探测 gateway 状态；失败不抛错，返回 reachable=false。 */
 async function probeGateway(settings) {
   try {
@@ -447,14 +545,38 @@ async function probeGateway(settings) {
  * catalog 方法：资产目录 + 连接状态。
  *
  * 目录来源优先级：gateway `/targets`（服务器端真实配置）> 本地 `config/log_targets.yaml`。
- * 本地 YAML 始终参与，用来补 env / kind / k8s 这些只影响面板展示的可选字段。
+ * 资产现在存在 gateway 的 SQLite 里，本地 YAML 只是可选的展示补充；文件缺失
+ * （例如已迁移成 .migrated）不再是错误——此时完全依赖 gateway 的字段。
+ * `/targets` 已透出 env / kind / k8s，因此网页新增的资产也能正确分类。
  */
 async function loadCatalog(settings) {
-  const loaded = loadTargets(settings.projectDir)
+  let loaded = { configFile: join(settings.projectDir, DEFAULT_CONFIG_FILE), raw: {} }
+  try {
+    loaded = loadTargets(settings.projectDir)
+  } catch (error) {
+    // YAML 缺失/损坏时降级：gateway 才是权威来源。
+    if (error && (error.code === 'config-unreadable' || error.code === 'config-invalid')) {
+      loaded = {
+        configFile: join(settings.projectDir, DEFAULT_CONFIG_FILE),
+        raw: {},
+        warning: error.message,
+      }
+    } else {
+      throw error
+    }
+  }
   const gateway = await probeGateway(settings)
   const localTargets = (loaded.raw && loaded.raw.targets) || {}
   const remoteTargets = gateway.targets && typeof gateway.targets === 'object' ? gateway.targets : null
   const entries = []
+  /** 把 gateway 条目里的展示字段转成 buildCatalog 需要的 optional 形状。 */
+  const optionalFromRemote = (target) => {
+    const optional = {}
+    if (target?.env) optional.env = target.env
+    if (target?.kind) optional.kind = target.kind
+    if (target?.k8s && typeof target.k8s === 'object') optional.k8s = target.k8s
+    return optional
+  }
   if (remoteTargets && Object.keys(remoteTargets).length > 0) {
     for (const [key, target] of Object.entries(remoteTargets)) {
       entries.push({
@@ -462,7 +584,8 @@ async function loadCatalog(settings) {
         description: target?.description ?? '',
         modules: target?.modules ?? {},
         connection: target?.connection ?? null,
-        optional: localTargets[key] ?? {},
+        // gateway 字段优先，本地 YAML 只补它没有的（例如手工写的 context）
+        optional: { ...(localTargets[key] ?? {}), ...optionalFromRemote(target) },
       })
     }
     for (const [key, target] of Object.entries(localTargets)) {
@@ -493,6 +616,7 @@ async function loadCatalog(settings) {
     configFile: loaded.configFile,
     tokenFile: settings.tokenPath,
     catalogSource: remoteTargets ? 'gateway' : 'local-yaml',
+    configWarning: loaded.warning ?? null,
     timezone: String(loaded.raw.log_timezone ?? 'Asia/Shanghai'),
     gateway: {
       baseUrl: settings.gatewayBaseUrl,
@@ -679,13 +803,81 @@ function createRestartTool(ctx) {
 }
 
 /** API 方法分发表。 */
-function createDispatcher(ctx, settings) {
+function createDispatcher(ctx, getSettings) {
+  /** 每次调用都重新解析设置：用户在面板里保存后立即生效，无需重载插件。 */
+  const withSettings = (fn) => fn(getSettings())
   return {
     async catalog() {
-      const catalog = await loadCatalog(settings)
+      const catalog = await withSettings((settings) => loadCatalog(settings))
       catalog.prompt = buildPromptHints(catalog)
       catalog.mcp = mcpStatus(ctx)
+      catalog.connection = describeSettings(getSettings())
       return catalog
+    },
+    async 'mcp.probe'() {
+      return probeMcp(getSettings())
+    },
+    async 'settings.get'() {
+      return describeSettings(getSettings())
+    },
+    async 'settings.save'(payload) {
+      const current = getSettings()
+      const gatewayBaseUrl = normalizeUrl(payload?.gatewayBaseUrl, '网关地址')
+      const mcpUrl = normalizeUrl(payload?.mcpUrl, 'MCP 地址')
+      // token 留空表示「保持不变」，避免用掩码值把真 token 覆盖掉。
+      const tokenInput = String(payload?.token ?? '').trim()
+      const token = tokenInput || current.token || ''
+      if (!token) {
+        const failure = new Error('token 不能为空')
+        failure.code = 'bad-request'
+        throw failure
+      }
+      writeSettings({ gatewayBaseUrl, mcpUrl, token }, current.settingsFile)
+      // MCP 行的 url / Authorization 是启动时求值出来的固定值，必须重启那条
+      // Loader 行才会用上新地址与新 token。重启失败不影响已保存的设置。
+      let mcp = null
+      try {
+        mcp = await restartMcpConnection(ctx)
+      } catch (error) {
+        mcp = { outcome: `error: ${error?.message ?? String(error)}`, readyAfter: false, toolCount: 0 }
+      }
+      return { ...describeSettings(getSettings()), mcp }
+    },
+    async 'settings.test'(payload) {
+      // 用「将要保存的值」试连，不落盘：便于先验证再保存。
+      // gateway 与 MCP 都要测 —— 只测 gateway 会放过「MCP 地址填错」这种最常见的问题。
+      const current = getSettings()
+      const target = {
+        ...current,
+        gatewayBaseUrl: payload?.gatewayBaseUrl
+          ? normalizeUrl(payload.gatewayBaseUrl, '网关地址')
+          : current.gatewayBaseUrl,
+        mcpUrl: payload?.mcpUrl ? normalizeUrl(payload.mcpUrl, 'MCP 地址') : current.mcpUrl,
+        token: String(payload?.token ?? '').trim() || current.token,
+      }
+      if (!target.token) {
+        const failure = new Error('token 不能为空')
+        failure.code = 'bad-request'
+        throw failure
+      }
+      const [gatewayResult, mcpResult] = await Promise.all([
+        gatewayRequest(target, 'GET', '/health')
+          .then((health) => ({
+            ok: true,
+            message: `网关连接成功：${health?.assets_total ?? 0} 个资产，已连接 ${health?.assets_connected ?? 0} 个`,
+          }))
+          .catch((error) => ({ ok: false, message: error?.message ?? String(error) })),
+        probeMcp(target),
+      ])
+      return {
+        ok: gatewayResult.ok && mcpResult.ok,
+        gatewayBaseUrl: target.gatewayBaseUrl,
+        mcpUrl: target.mcpUrl,
+        gateway: { ok: gatewayResult.ok, message: gatewayResult.message },
+        mcp: { ok: mcpResult.ok, message: mcpResult.message },
+        // 兼容旧调用方：message 汇总两条结果
+        message: `${gatewayResult.ok ? '✅' : '❌'} ${gatewayResult.message}；${mcpResult.ok ? '✅' : '❌'} ${mcpResult.message}`,
+      }
     },
     async 'mcp.status'() {
       return mcpStatus(ctx)
@@ -700,7 +892,7 @@ function createDispatcher(ctx, settings) {
         failure.code = 'bad-request'
         throw failure
       }
-      const result = await gatewayRequest(settings, 'POST', '/connect', { server })
+      const result = await withSettings((settings) => gatewayRequest(settings, 'POST', '/connect', { server }))
       return { server, result }
     },
     async 'k8s.namespaces'(payload) {
@@ -710,7 +902,7 @@ function createDispatcher(ctx, settings) {
         failure.code = 'bad-request'
         throw failure
       }
-      const stdout = await systemQuery(settings, server, 'kubectl get namespaces -o name')
+      const stdout = await withSettings((settings) => systemQuery(settings, server, 'kubectl get namespaces -o name'))
       return { server, namespaces: parseKubectlNames(stdout) }
     },
     async 'k8s.pods'(payload) {
@@ -722,9 +914,37 @@ function createDispatcher(ctx, settings) {
         throw failure
       }
       const safeNamespace = namespace.replace(/[^A-Za-z0-9._-]/g, '')
-      const stdout = await systemQuery(settings, server, `kubectl get pods -n ${safeNamespace} -o name`)
+      const stdout = await withSettings((settings) =>
+        systemQuery(settings, server, `kubectl get pods -n ${safeNamespace} -o name`),
+      )
       return { server, namespace: safeNamespace, pods: parseKubectlNames(stdout) }
     },
+  }
+}
+
+/** 面板展示用的连接设置（token 只回掩码，绝不回明文）。 */
+function describeSettings(settings) {
+  return {
+    gatewayBaseUrl: settings.gatewayBaseUrl,
+    mcpUrl: settings.mcpUrl,
+    tokenMasked: maskToken(settings.token || (() => {
+      try {
+        return readFileSync(settings.tokenPath, 'utf8').trim()
+      } catch {
+        return ''
+      }
+    })()),
+    hasToken: Boolean(
+      settings.token || (() => {
+        try {
+          return readFileSync(settings.tokenPath, 'utf8').trim()
+        } catch {
+          return false
+        }
+      })(),
+    ),
+    settingsFile: settings.settingsFile || settingsPath(),
+    source: settings.source,
   }
 }
 
@@ -797,8 +1017,9 @@ const SYSTEM_PROMPT_SECTION = [
  * @param config - `{ projectDir?, tokenPath?, gatewayBaseUrl? }`。
  */
 export function apply(ctx, config) {
-  const settings = resolveSettings(config)
-  const dispatch = createDispatcher(ctx, settings)
+  // 保存的设置在右栏里修改后立即生效：每次请求都重新解析一次（读一个很小的 JSON）。
+  const getSettings = () => resolveSettings(config)
+  const dispatch = createDispatcher(ctx, getSettings)
 
   ctx.effect(() =>
     ctx.webServer.register({
@@ -873,10 +1094,13 @@ export const internals = {
   inferKind,
   loadCatalog,
   probeGateway,
+  probeMcp,
   gatewayRequest,
   systemQuery,
   parseKubectlNames,
   resolveSettings,
+  describeSettings,
+  createDispatcher,
   mcpStatus,
   findLoaderEntry,
   restartMcpConnection,

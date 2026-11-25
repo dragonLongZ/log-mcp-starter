@@ -13,15 +13,20 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
+SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 TOKEN_PATH = ROOT / "local.token"
 LogType = Literal["info", "error", "both"]
 MAX_SERVERS_PER_QUERY = 10
 
 
 def load_config() -> dict[str, Any]:
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """只读部署设置（settings.yaml）。
+
+    MCP 进程只需要 jumpserver.bind_port / mcp_server.bind_*，不需要资产清单，
+    因此这里**不**打开 SQLite —— 资产数据只由 gateway 一个进程写。
+    """
+    with SETTINGS_PATH.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 def bridge_settings() -> tuple[str, str]:

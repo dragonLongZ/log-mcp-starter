@@ -1,0 +1,37 @@
+# 资产示例 / 种子配置。
+#
+# 运行时资产存在 SQLite（默认 data/logmcp.db，已 gitignore），由网页仪表盘维护。
+# 本文件只用于两件事：
+#   1. 开源使用者了解每条资产要填哪些字段；
+#   2. 首次启动可从本文件或旧 config/log_targets.yaml 一键导入
+#      （仪表盘「手动导入」→ 粘贴内容 → 试运行 → 导入）。
+#
+# 每个资产的必填字段：description、ssh_username。
+# 可选字段（只影响 DSH「日志上下文」面板的展示与筛选，gateway 会忽略）：
+#   env:        环境名（生产/测试/研发/网关/演示…）；缺省从 description 里推断。
+#   kind:       "linux"（默认）或 "k8s"；缺省按 description 是否含 K8s/Kubernetes 推断。
+#   k8s:
+#     context:    集群名，仅用于面板展示。
+#     namespaces: 常用命名空间列表；不写也可以在面板里用「拉取」动态查询。
+#   Linux 资产的 modules.<模块>.log_dir 是日志目录；K8S 资产通常不需要 modules。
+
+log_timezone: "Asia/Shanghai"
+
+targets:
+  server-10.0.0.11-order-api:
+    description: "订单服务所在主机（示例：删掉后填你自己的资产）"
+    env: "测试"
+    ssh_username: "yourname#root#10.0.0.11"
+    modules:
+      order-api:
+        description: "订单服务：下单、支付回调、退款"
+        log_dir: "/data/apps/order-api/logs"
+
+  server-10.0.0.12-k8s:
+    description: "K8s 集群节点（示例）"
+    env: "研发"
+    kind: k8s
+    ssh_username: "yourname#root#10.0.0.12"
+    k8s:
+      context: "dev-cluster"
+      namespaces: ["default", "middleware"]

@@ -1,24 +1,21 @@
 """自定义系统命令白名单 —— 网关内置白名单的运行时扩展。
 
-`system_guard.py` 内置了一份系统命令白名单；不在内置白/黑名单里的命令会返回
+``system_guard.py`` 内置了一份系统命令白名单；不在内置白/黑名单里的命令会返回
 UNKNOWN，模型只能提示用户手工执行。本模块提供一份**可在线维护**的补充白名单：
 
-  * 存储：``config/system_allowlist.yaml``（与 log_targets.yaml 同目录，便于备份/进版本库）。
-  * 热加载：每次校验都按文件 mtime/size 判断是否变化，变了才重新解析，
-    因此网页上增删一条后，下一次请求立即生效，无需重启 gateway。
+  * 存储：与资产同一个 SQLite 数据库（``config_store``，默认 ``data/logmcp.db``），
+    表 ``allowlist_entries``。开源仓库只需 gitignore 一个数据库文件。
+  * 即时生效：校验时直接从数据库读取（进程内按内容指纹做短缓存），
+    网页上增删一条后，下一次请求立即生效，无需重启 gateway。
   * 只做“加白”：黑名单（rm/sudo/docker rm…）与通用安全规则（禁止重定向、
-    串联、命令替换、awk 写原语…）始终优先，无法通过本文件绕过。
+    串联、命令替换、awk 写原语…）始终优先，无法通过本模块绕过。
 
-文件格式::
+库表字段::
 
-    version: 1
-    commands:
-      - name: "htop"                 # 命令前缀，按空格切成 token 逐级匹配
-      - name: "docker compose ls"
-      - name: "ncdu"
-        denied: ["-o", "--output"]   # 可选：出现这些 flag 时仍拒绝
-        note: "只看目录占用"
-        added_at: "2026-11-19 10:00:00"
+    name      命令前缀（按空格切成 token 逐级匹配）
+    denied    该命令仍禁止的 flag / 子命令列表（JSON 数组）
+    note      备注
+    added_at  添加时间
 
 ``name`` 只允许字母/数字与少量符号（``- _ . / : = + @ * ?[]``），拒绝空白以外的
 shell 元字符，防止有人把 ``ps; rm -rf /`` 之类整条命令塞进白名单。
@@ -28,14 +25,10 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-import yaml
-
-ROOT = Path(__file__).resolve().parent
-ALLOWLIST_PATH = ROOT / "config" / "system_allowlist.yaml"
+import config_store
 
 MAX_ENTRIES = 500
 MAX_NAME_LEN = 120
@@ -85,30 +78,32 @@ class AllowEntry:
 
 @dataclass
 class _Snapshot:
-    """一次解析结果 + 用于判断文件是否变化的指纹。"""
+    """一次读取结果 + 用于判断数据是否变化的指纹。"""
 
     entries: tuple[AllowEntry, ...] = ()
     warnings: list[str] = field(default_factory=list)
-    signature: tuple[int, int] | None = None
+    signature: tuple | None = None
 
 
 _lock = threading.Lock()
 _cache = _Snapshot()
-_override_path: Path | None = None
+_override_db: Path | None = None
 
 
 def set_path(path: str | os.PathLike[str] | None) -> None:
-    """覆盖白名单文件路径（测试用）；传 None 恢复默认的 config/system_allowlist.yaml。"""
-    global _override_path
-    with _lock:
-        _override_path = None if path is None else Path(path)
+    """覆盖白名单所在的数据库路径（测试用）；传 None 恢复默认数据库。"""
+    config_store.set_paths(db=path)
     invalidate()
 
 
 def current_path() -> Path:
-    """当前使用的白名单文件路径。"""
-    return _override_path or ALLOWLIST_PATH
+    """当前使用的数据库文件路径（页面展示「配置存哪里」用）。"""
+    return config_store.db_path()
 
+
+def _db_ready() -> Path:
+    config_store.init_db()
+    return config_store.db_path()
 
 
 # ---------------------------------------------------------------------------
@@ -182,38 +177,26 @@ def _clean_note(raw: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 读盘 / 缓存
+# 读：数据库 → 条目快照（按内容指纹缓存，写盘后 invalidate）
 # ---------------------------------------------------------------------------
-def _signature() -> tuple[int, int] | None:
+def _build_snapshot() -> _Snapshot:
+    _db_ready()
     try:
-        stat = current_path().stat()
-    except OSError:
-        return None
-    return stat.st_mtime_ns, stat.st_size
+        rows = config_store.load_allowlist_rows()
+    except Exception as exc:  # 数据库坏了也不能让网关整体失效
+        return _Snapshot(
+            entries=(),
+            warnings=[f"cannot read allowlist database: {type(exc).__name__}: {exc}"],
+            signature=None,
+        )
 
-
-def _parse(raw: Any) -> tuple[list[AllowEntry], list[str]]:
-    """把 YAML 内容解析成条目；坏条目跳过并收集警告（不因一条坏数据让整个网关不可用）。"""
     entries: list[AllowEntry] = []
     warnings: list[str] = []
-    if raw is None:
-        return entries, warnings
-    if not isinstance(raw, dict):
-        return entries, ["system_allowlist.yaml is not a mapping; ignored."]
-    commands = raw.get("commands") or []
-    if not isinstance(commands, list):
-        return entries, ["'commands' must be a list; ignored."]
-
-    seen: dict[str, AllowEntry] = {}
-    for index, item in enumerate(commands):
-        if isinstance(item, str):
-            item = {"name": item}
-        if not isinstance(item, dict):
-            warnings.append(f"entry #{index + 1} is not a mapping; skipped.")
-            continue
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
         try:
-            name = normalize_name(str(item.get("name", "")))
-            denied = normalize_denied(item.get("denied"))
+            name = normalize_name(str(row.get("name", "")))
+            denied = normalize_denied(row.get("denied"))
         except AllowlistError as exc:
             warnings.append(f"entry #{index + 1} skipped: {exc}")
             continue
@@ -224,42 +207,32 @@ def _parse(raw: Any) -> tuple[list[AllowEntry], list[str]]:
         if blocked:
             warnings.append(f"entry #{index + 1} skipped: {blocked}")
             continue
-        entry = AllowEntry(
-            name=name,
-            denied=denied,
-            note=_clean_note(item.get("note")),
-            added_at=str(item.get("added_at", "") or ""),
-        )
         if name in seen:
             warnings.append(f"duplicate entry '{name}' ignored.")
             continue
-        seen[name] = entry
-        entries.append(entry)
+        seen.add(name)
+        entries.append(AllowEntry(
+            name=name,
+            denied=denied,
+            note=_clean_note(row.get("note")),
+            added_at=str(row.get("added_at", "") or ""),
+        ))
     if len(entries) >= MAX_ENTRIES:
-        warnings.append(f"allowlist reached the {MAX_ENTRIES}-entry limit; further entries are kept but may be trimmed.")
-    return entries, warnings
-
-
-def _read_entries() -> tuple[list[AllowEntry], list[str]]:
-    path = current_path()
-    if not path.exists():
-        return [], []
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        return [], [f"cannot read {path.name}: {type(exc).__name__}: {exc}"]
-    return _parse(raw)
+        warnings.append(
+            f"allowlist reached the {MAX_ENTRIES}-entry limit; further entries are kept but may be trimmed."
+        )
+    signature = tuple((entry.name, entry.denied, entry.note) for entry in entries)
+    return _Snapshot(entries=tuple(entries), warnings=warnings, signature=signature)
 
 
 def current() -> _Snapshot:
-    """返回当前白名单快照；文件变了才重新解析（热加载）。"""
+    """当前白名单快照；数据没变就复用上一次的解析结果。"""
     global _cache
-    signature = _signature()
     with _lock:
-        if _cache.signature == signature:
+        snapshot = _build_snapshot()
+        if _cache.signature is not None and _cache.signature == snapshot.signature:
             return _cache
-        entries, warnings = _read_entries()
-        _cache = _Snapshot(entries=tuple(entries), warnings=warnings, signature=signature)
+        _cache = snapshot
         return _cache
 
 
@@ -273,44 +246,15 @@ def warnings() -> list[str]:
 
 
 def invalidate() -> None:
-    """强制下次读取重新解析（写盘后调用）。"""
+    """强制下次读取重新构建快照（写盘后调用）。"""
     global _cache
     with _lock:
         _cache = _Snapshot()
 
 
 # ---------------------------------------------------------------------------
-# 写盘
+# 写
 # ---------------------------------------------------------------------------
-def _write(entries: list[AllowEntry]) -> None:
-    """原子写入：先写临时文件再 os.replace，避免读到半个文件。"""
-    path = current_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": 1,
-        "commands": [
-            {k: v for k, v in entry.to_dict().items() if v not in ((), [], "")}
-            for entry in entries
-        ],
-    }
-    text = (
-        "# 自定义系统命令白名单 —— 由 gateway 仪表盘维护，也可手工编辑。\n"
-        "# 这里的命令会追加到 system_guard.py 的内置白名单之后；黑名单与通用安全规则仍然优先。\n"
-        "# 每条：name（命令前缀，必填）、denied（可选，禁用 flag 列表）、note、added_at。\n"
-        + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
-    )
-    try:
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as exc:
-        raise AllowlistError(
-            f"Cannot write {path.name}: {type(exc).__name__}: {exc}. "
-            "Check that the gateway process owns the config directory and has write permission."
-        ) from exc
-    invalidate()
-
-
 def is_blocked_name(name: str) -> str | None:
     """拒绝把黑名单命令登记进自定义白名单；返回原因，可登记时返回 None。
 
@@ -354,33 +298,19 @@ def add_entry(name: str, denied: Iterable[str] | str | None = None, note: str = 
     exists = any(entry.name == norm_name for entry in entries)
     if not exists and len(entries) >= MAX_ENTRIES:
         raise AllowlistError(f"Allowlist is full ({MAX_ENTRIES} entries); delete some first.")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    updated = AllowEntry(
-        name=norm_name,
-        denied=norm_denied,
-        note=_clean_note(note),
-        added_at=timestamp,
-    )
-    merged: list[AllowEntry] = []
-    replaced = False
-    for entry in entries:
-        if entry.name == norm_name:
-            merged.append(updated)
-            replaced = True
-        else:
-            merged.append(entry)
-    if not replaced:
-        merged.append(updated)
-    _write(merged)
-    return merged
+    _db_ready()
+    config_store.upsert_allowlist_entry(norm_name, norm_denied, _clean_note(note))
+    invalidate()
+    return load_allowlist()
 
 
 def remove_entry(name: str) -> list[AllowEntry]:
     """删除一条白名单；不存在时抛 AllowlistError。"""
     norm_name = normalize_name(name)
-    entries = load_allowlist()
-    remaining = [entry for entry in entries if entry.name != norm_name]
-    if len(remaining) == len(entries):
+    _db_ready()
+    rows = config_store.load_allowlist_rows()
+    if not any(str(row.get("name")) == norm_name for row in rows):
         raise AllowlistError(f"Entry not found: {norm_name}")
-    _write(remaining)
-    return remaining
+    config_store.delete_allowlist_entry(norm_name)
+    invalidate()
+    return load_allowlist()

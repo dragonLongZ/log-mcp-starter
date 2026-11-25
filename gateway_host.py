@@ -20,13 +20,13 @@ from typing import Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncssh
-import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
 import system_allowlist
+import config_store
 from command_guard import CommandValidationError, validate_query_command
 from dashboard_html import DASHBOARD_HTML, LOGIN_HTML
 from system_allowlist import (
@@ -39,7 +39,6 @@ from system_allowlist import (
 from system_guard import Verdict, validate_system_info_command
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "log_targets.yaml"
 TOKEN_PATH = ROOT / "local.token"
 MAX_READ_BYTES = 100_000
 MAX_LINES = 2_000
@@ -72,17 +71,12 @@ INFO_MARKERS = ("info", "stdout", "access")
 
 
 def load_config() -> dict[str, Any]:
-    """加载并校验配置：每个资产必须有 ssh_username，心跳间隔须在 1-60 分钟。"""
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    if not isinstance(config, dict) or "jumpserver" not in config or "targets" not in config:
-        raise RuntimeError(f"Invalid configuration: {CONFIG_PATH}")
-    for name, target in (config["targets"] or {}).items():
-        if not str((target or {}).get("ssh_username", "")).strip():
-            raise RuntimeError(
-                f"Target '{name}' is missing 'ssh_username'. Migration: move the old "
-                "jumpserver.username into each target as ssh_username."
-            )
+    """加载并校验配置：部署设置来自 settings.yaml，资产来自 SQLite。
+
+    资产级错误**不再**抛异常：单条脏数据会被跳过并通过 ``_warnings`` 透出，
+    避免一条坏配置让整个网关（以及 import 同一文件的 mcp_server）起不来。
+    """
+    config = config_store.load_config()
     try:
         interval = int(config["jumpserver"].get("keepalive_interval_minutes", DEFAULT_KEEPALIVE_MINUTES))
     except (TypeError, ValueError) as exc:
@@ -90,6 +84,28 @@ def load_config() -> dict[str, Any]:
     if not 1 <= interval <= 60:
         raise RuntimeError("jumpserver.keepalive_interval_minutes must be between 1 and 60.")
     return config
+
+
+def dashboard_writes_enabled() -> bool:
+    """网页写操作开关：网关可能监听 0.0.0.0，默认允许但可一键关闭。"""
+    try:
+        settings = config_store.load_settings()
+    except Exception:
+        return False
+    flag = (settings.get("dashboard") or {}).get("write_enabled", True)
+    return bool(flag)
+
+
+def require_writes_enabled() -> None:
+    """写接口守卫：关闭时返回 403，读接口不受影响。"""
+    if not dashboard_writes_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Dashboard writes are disabled. Set dashboard.write_enabled: true in "
+                "config/settings.yaml and restart gateway to allow adding/removing assets."
+            ),
+        )
 
 
 def read_token() -> str:
@@ -459,6 +475,35 @@ class AllowlistCheckRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
 
 
+class TargetUpsertRequest(BaseModel):
+    """网页新增/编辑资产。``modules`` 是「模块名 → {log_dir, description}」的映射。
+
+    字段不做 min_length 约束：空值交给 ``config_store.validate_target`` 处理，
+    这样「试运行校验」能把「资产名不能为空」这类提示原样返回（而不是 422）。
+    """
+
+    name: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=200)
+    env: str = Field(default="", max_length=200)
+    kind: Literal["linux", "k8s"] = "linux"
+    ssh_username: str = Field(default="", max_length=200)
+    modules: dict[str, dict[str, str]] = Field(default_factory=dict)
+    k8s_context: str = Field(default="", max_length=200)
+    k8s_namespaces: list[str] = Field(default_factory=list, max_length=50)
+
+
+class TargetEnabledRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+
+
+class TargetImportRequest(BaseModel):
+    """批量导入：``content`` 是 YAML/JSON 文本；``dry_run`` 只校验不落库。"""
+
+    content: str = Field(min_length=1, max_length=200_000)
+    dry_run: bool = False
+
+
 def check_bearer(authorization: str | None = Header(default=None)) -> None:
     """校验请求携带的 bearer token（本地 bridge 的唯一鉴权）。"""
     expected = read_token()
@@ -817,7 +862,8 @@ async def search_files_on_ssh(app: FastAPI, server: str, paths: list[str], keywo
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：建连接池、起心跳任务、按 auto_connect 预认证；退出时清理。"""
+    """应用生命周期：建库、建连接池、起心跳任务、按 auto_connect 预认证；退出时清理。"""
+    config_store.init_db()
     config = load_config()
     read_token()
     manager = ConnectionManager(config)
@@ -845,35 +891,52 @@ app = FastAPI(title="Local Multi-asset Directory-discovery Log Gateway", lifespa
 
 @app.get("/health")
 async def health(_config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
-    """健康检查：资产总数、已连接数、已连接资产名。"""
+    """健康检查：资产总数、已连接数、已连接资产名、配置告警。"""
     manager: ConnectionManager = app.state.manager
     connected = manager.connected_assets()
     return {
         "assets_total": len(manager.assets),
         "assets_connected": len(connected),
         "connected_servers": [asset.server for asset in connected],
+        "config_warnings": config_store.warnings(),
+        "dashboard_write_enabled": dashboard_writes_enabled(),
     }
 
 
 @app.get("/targets")
 async def targets(config: dict[str, Any] = Depends(get_synced_config), _: None = Depends(check_bearer)) -> dict[str, Any]:
-    """列出全部资产、模块（含业务描述）、日志目录与连接状态。"""
+    """列出全部资产、模块（含业务描述）、日志目录与连接状态。
+
+    除 description/modules/connection 外还透出 env / kind / k8s：
+    DSH「日志上下文」插件只从本接口拿目录，缺了这些字段网页新加的资产
+    在右栏会丢环境筛选、K8S 资产直接不显示。
+    """
     manager: ConnectionManager = app.state.manager
     statuses = {item["server"]: item for item in manager.statuses()}
-    return {
-        "targets": {
-            name: {
-                "description": target.get("description", ""),
-                "modules": {
-                    module: {"log_dir": cfg.get("log_dir", ""), "description": cfg.get("description", "")}
-                    for module, cfg in (target.get("modules") or {}).items()
-                },
-                "connection": statuses.get(name),
+    payload: dict[str, Any] = {}
+    for name, target in config["targets"].items():
+        entry: dict[str, Any] = {
+            "description": target.get("description", ""),
+            "env": target.get("env", ""),
+            "kind": target.get("kind", "linux"),
+            "modules": {
+                module: {"log_dir": cfg.get("log_dir", ""), "description": cfg.get("description", "")}
+                for module, cfg in (target.get("modules") or {}).items()
+            },
+            "connection": statuses.get(name),
+        }
+        k8s = target.get("k8s")
+        if isinstance(k8s, dict):
+            entry["k8s"] = {
+                "context": k8s.get("context", ""),
+                "namespaces": k8s.get("namespaces") or [],
             }
-            for name, target in config["targets"].items()
-        },
+        payload[name] = entry
+    return {
+        "targets": payload,
         "log_timezone": config.get("log_timezone", "UTC"),
         "supported_day_values": ["today", "yesterday", "YYYY-MM-DD"],
+        "config_warnings": config.get("_warnings") or [],
     }
 
 
@@ -1042,6 +1105,166 @@ async def dashboard_connect(
         "mfa_code": body.mfa_code,
     }
     return request.app.state.manager.request_connect(body.server)
+
+
+# ── 资产管理（网页登记资产，写入 SQLite，免重启） ──────────────
+
+
+def _targets_payload() -> dict[str, Any]:
+    """页面用的资产清单：合并后的条目 + 连接状态 + 存储位置 + 告警。"""
+    manager: ConnectionManager = app.state.manager
+    statuses = {item["server"]: item for item in manager.statuses()}
+    items = []
+    for item in config_store.list_targets_meta():
+        items.append({
+            **item,
+            "connection": statuses.get(item["name"]),
+        })
+    return {
+        "targets": items,
+        "db_path": str(config_store.db_path()),
+        "warnings": config_store.warnings(),
+        "writes_enabled": dashboard_writes_enabled(),
+        "limits": {
+            "max_targets": config_store.MAX_TARGETS,
+            "max_modules_per_target": config_store.MAX_MODULES_PER_TARGET,
+        },
+    }
+
+
+async def _after_config_change(request: Request) -> list[dict[str, Any]]:
+    """写库后立即同步连接池，让本次响应就反映新状态（无需等下一次请求）。"""
+    config = load_config()
+    await request.app.state.manager.sync_config(config)
+    return request.app.state.manager.statuses()
+
+
+@app.get("/dashboard/targets")
+async def dashboard_targets(_: None = Depends(check_bearer)) -> dict[str, Any]:
+    """资产清单（含停用条目、模块、连接状态、数据库路径）。"""
+    return _targets_payload()
+
+
+@app.post("/dashboard/targets")
+async def dashboard_targets_upsert(
+    body: "TargetUpsertRequest",
+    request: Request,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """新增或整条覆盖一个资产；写库后连接池立即同步。"""
+    require_writes_enabled()
+    try:
+        entry = config_store.upsert_target(body.name, {
+            "description": body.description,
+            "env": body.env,
+            "kind": body.kind,
+            "ssh_username": body.ssh_username,
+            "modules": body.modules,
+            "k8s": {"context": body.k8s_context, "namespaces": body.k8s_namespaces},
+        })
+    except config_store.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _after_config_change(request)
+    return {"target": entry, **_targets_payload()}
+
+
+@app.delete("/dashboard/targets")
+async def dashboard_targets_delete(
+    request: Request,
+    name: str,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """删除一个资产（连同模块）；其 SSH 连接会被关闭。"""
+    require_writes_enabled()
+    try:
+        config_store.delete_target(name)
+    except config_store.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 删掉资产后立刻清掉可能残留的临时凭据，避免密码留在内存里。
+    PENDING_CREDENTIALS.pop(name, None)
+    await _after_config_change(request)
+    return _targets_payload()
+
+
+@app.post("/dashboard/targets/enabled")
+async def dashboard_targets_enabled(
+    body: "TargetEnabledRequest",
+    request: Request,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """启用/停用资产：停用后从连接池消失，数据保留。"""
+    require_writes_enabled()
+    try:
+        config_store.set_enabled(body.name, body.enabled)
+    except config_store.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not body.enabled:
+        PENDING_CREDENTIALS.pop(body.name, None)
+    await _after_config_change(request)
+    return _targets_payload()
+
+
+@app.post("/dashboard/targets/validate")
+async def dashboard_targets_validate(body: "TargetUpsertRequest") -> dict[str, Any]:
+    """干跑校验：只做静态检查，不落库、不发往任何资产。"""
+    try:
+        entry = config_store.validate_target(body.name, {
+            "description": body.description,
+            "env": body.env,
+            "kind": body.kind,
+            "ssh_username": body.ssh_username,
+            "modules": body.modules,
+            "k8s": {"context": body.k8s_context, "namespaces": body.k8s_namespaces},
+        })
+    except config_store.ConfigError as exc:
+        return {"valid": False, "error": str(exc)}
+    return {"valid": True, "target": entry}
+
+
+@app.post("/dashboard/targets/import")
+async def dashboard_targets_import(
+    body: "TargetImportRequest",
+    request: Request,
+    _: None = Depends(check_bearer),
+) -> dict[str, Any]:
+    """从 YAML/JSON 文本批量导入资产；dry_run=true 时只校验。"""
+    if not body.dry_run:
+        require_writes_enabled()
+    try:
+        result = config_store.import_targets(body.content, dry_run=body.dry_run)
+    except config_store.ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not body.dry_run:
+        await _after_config_change(request)
+        result["targets"] = _targets_payload()["targets"]
+    return result
+
+
+@app.get("/dashboard/targets/export")
+async def dashboard_targets_export(
+    token: str | None = None,
+    format: str = "yaml",
+) -> Any:
+    """导出合并后的完整配置，可回灌到 example 文件或迁移到别的机器。
+
+    浏览器直接下载，因此同时接受 ``?token=``（与 /dashboard 一致）。
+    """
+    expected = read_token()
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    if format == "allowlist":
+        text = config_store.export_allowlist_text()
+        filename = "system_allowlist.yaml"
+    else:
+        text = config_store.export_config_text()
+        filename = "log_targets.yaml"
+    from fastapi.responses import PlainTextResponse
+
+    return PlainTextResponse(
+        text,
+        media_type="text/yaml; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── 自定义命令白名单（网页可增删，逐请求热加载） ──────────────
