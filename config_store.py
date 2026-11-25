@@ -392,6 +392,9 @@ settings.yaml，于是两个服务同时起不来。
 """
 _SETTINGS_KEYS = ("jumpserver", "mcp_server", "log_timezone", "storage", "dashboard")
 
+# 最近一次自动生成失败时的诊断信息，供 load_settings() 的报错引用。
+_bootstrap_diagnostics: list[str] = []
+
 
 def read_text_lenient(path: Path) -> str:
     """读取文本配置：兼容 UTF-8 BOM 与 Windows 下常见的 UTF-16 / GBK。
@@ -412,13 +415,40 @@ def read_text_lenient(path: Path) -> str:
 
 
 def _settings_candidates() -> list[Path]:
-    """可能含部署设置的旧配置文件（按存在性过滤，去重且保持顺序）。"""
+    """可能含部署设置的旧配置文件（按存在性过滤，去重且保持顺序）。
+
+    除了同目录的 log_targets.yaml / .migrated，还顺带认这几种常见落点，
+    因为迁移后它们常常被运维挪到别处：
+      * config/log_targets.yaml.bak（手工备份）
+      * config/log_targets.local.yaml（早期覆盖层命名）
+    """
+    config_dir = settings_path().parent
+    names = (
+        LEGACY_TARGETS_PATH.name,
+        LEGACY_TARGETS_PATH.name + ".migrated",
+        LEGACY_TARGETS_PATH.name + ".bak",
+        "log_targets.local.yaml",
+    )
     seen: dict[Path, None] = {}
-    for base in (legacy_targets_path(), settings_path().parent / LEGACY_TARGETS_PATH.name):
-        for candidate in (base, base.with_name(base.name + ".migrated")):
-            if candidate.exists():
-                seen.setdefault(candidate, None)
+    # legacy_targets_path() 可能被显式覆盖（测试/自定义布局），优先它，含其 .migrated。
+    legacy = legacy_targets_path()
+    for candidate in (
+        legacy,
+        legacy.with_name(legacy.name + ".migrated"),
+        *(config_dir / name for name in names),
+    ):
+        if candidate.exists():
+            seen.setdefault(candidate, None)
     return list(seen)
+
+
+def _describe_path_state(path: Path) -> str:
+    """给一条诊断用的事实描述（存在/不存在、大小），排查升级问题时很省事。"""
+    try:
+        stat = path.stat()
+        return f"存在（{stat.st_size} 字节）"
+    except OSError:
+        return "不存在"
 
 
 def bootstrap_settings_from_legacy() -> Path | None:
@@ -430,12 +460,34 @@ def bootstrap_settings_from_legacy() -> Path | None:
     path = settings_path()
     if path.exists():
         return None
-    for candidate in _settings_candidates():
+    _bootstrap_diagnostics.clear()
+    candidates = _settings_candidates()
+    if not candidates:
+        # 明确说出找过哪里：否则用户只能看到「缺少 settings.yaml」，
+        # 不知道自己该把旧文件放回哪个目录。
+        config_dir = path.parent
+        looked = [
+            config_dir / LEGACY_TARGETS_PATH.name,
+            config_dir / (LEGACY_TARGETS_PATH.name + ".migrated"),
+            config_dir / (LEGACY_TARGETS_PATH.name + ".bak"),
+            config_dir / "log_targets.local.yaml",
+        ]
+        print("[info] 未找到可用于自动生成设置的文件，已查找：")
+        for item in looked:
+            state = _describe_path_state(item)
+            print(f"       - {item}：{state}")
+            _bootstrap_diagnostics.append(f"{item}：{state}")
+        return None
+
+    rejected: list[str] = []
+    for candidate in candidates:
         try:
             raw = yaml.safe_load(read_text_lenient(candidate)) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, yaml.YAMLError) as exc:
+            rejected.append(f"{candidate.name}（无法解析：{type(exc).__name__}）")
             continue
         if not isinstance(raw, dict) or "jumpserver" not in raw:
+            rejected.append(f"{candidate.name}（缺少 jumpserver 段）")
             continue
         extracted = {key: raw[key] for key in _SETTINGS_KEYS if key in raw}
         # 用正斜杠：settings.yaml 可能被复制到 Linux 服务器，反斜杠在 POSIX 下不是分隔符。
@@ -453,13 +505,17 @@ def bootstrap_settings_from_legacy() -> Path | None:
                 encoding="utf-8",
             )
         except OSError as exc:
-            print(f"[warn] 无法自动生成 {path}：{exc}")
+            print(f"[warn] 无法写入 {path}：{exc}")
             return None
         print(
             f"[info] 已从 {candidate.name} 自动生成 {path.name}（抽取 "
             f"{', '.join(extracted)}）。如需调整请直接编辑该文件。"
         )
         return path
+
+    if rejected:
+        print("[warn] 找到候选文件但都无法使用：" + "；".join(rejected))
+        _bootstrap_diagnostics.extend(rejected)
     return None
 
 
@@ -471,8 +527,11 @@ def load_settings() -> dict[str, Any]:
         if generated is not None:
             path = generated
     if not path.exists():
+        detail = ""
+        if _bootstrap_diagnostics:
+            detail = "\n已尝试自动生成，但未成功：\n  " + "\n  ".join(_bootstrap_diagnostics)
         raise RuntimeError(
-            f"缺少部署设置文件 {path}。\n"
+            f"缺少部署设置文件 {path}。{detail}\n"
             "首次使用请先复制示例并按需修改：\n"
             f"    cp {EXAMPLE_SETTINGS_PATH} {path}\n"
             "至少需要 jumpserver.host；其余（bind_*、keepalive、log_timezone、storage）可沿用示例值。\n"
