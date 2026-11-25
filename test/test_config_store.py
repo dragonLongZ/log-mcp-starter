@@ -349,6 +349,17 @@ class TestSettings:
             config_store.load_settings()
         assert not config_store.settings_path().exists()
 
+    def test_empty_legacy_file_reported_clearly(self):
+        """`git show 失败的 rev > file` 会留下空文件：报错要说清是空文件。"""
+        self._drop_settings()
+        config_store.legacy_targets_path().write_bytes(b"")
+        with pytest.raises(RuntimeError) as excinfo:
+            config_store.load_settings()
+        message = str(excinfo.value)
+        assert "空文件" in message
+        assert "git show" in message
+        assert not config_store.settings_path().exists()
+
     def test_bootstrap_survives_utf16_legacy_file(self):
         """PowerShell `git show > file` 会写成 UTF-16；恢复旧配置后必须仍能解析。"""
         self._drop_settings()

@@ -487,7 +487,14 @@ def bootstrap_settings_from_legacy() -> Path | None:
             rejected.append(f"{candidate.name}（无法解析：{type(exc).__name__}）")
             continue
         if not isinstance(raw, dict) or "jumpserver" not in raw:
-            rejected.append(f"{candidate.name}（缺少 jumpserver 段）")
+            size = candidate.stat().st_size if candidate.exists() else 0
+            if size == 0:
+                rejected.append(
+                    f"{candidate.name}（空文件）—— 常见原因：`git show <rev>:file > 文件` "
+                    "执行失败时重定向仍会创建空文件，请确认 rev 与路径正确"
+                )
+            else:
+                rejected.append(f"{candidate.name}（缺少 jumpserver 段，{size} 字节）")
             continue
         extracted = {key: raw[key] for key in _SETTINGS_KEYS if key in raw}
         # 用正斜杠：settings.yaml 可能被复制到 Linux 服务器，反斜杠在 POSIX 下不是分隔符。
