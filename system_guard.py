@@ -178,14 +178,37 @@ def _custom_entries() -> list[system_allowlist.AllowEntry]:
         return []
 
 
+def _custom_denied_hit(toks: list[str], entry: system_allowlist.AllowEntry) -> str | None:
+    """自定义白名单的「禁用参数」检查，返回命中的那个值；未命中返回 None。
+
+    为什么不能只用 safecmd 的 CmdSpec：它对长度 > 2 且不以 `--` 开头的 denied
+    值只做**整 token 精确匹配**，于是组合写法能绕过：
+
+        denied 含 `-dump:live` / `format=b` / `file=`
+        `jmap -dump:live,format=b,file=/tmp/x.bin 1234`  ← 单个 token，精确匹配不到 → 放行
+
+    jmap 的 `-dump:...` 本身就会把堆导出到文件，属于明确的写操作，不能被绕过。
+    因此这里对长度 > 2 的值再做一次「子串包含」判断；长度 == 2 的短 flag
+    （如 `-F`）仍交给 safecmd（它已按单字符包含判断，能拦住 `-Fb`）。
+    """
+    for denied in entry.denied:
+        if len(denied) <= 2:
+            continue
+        for token in toks:
+            if denied in token:
+                return denied
+    return None
+
+
 def _match_custom(toks: list[str], entries: list[system_allowlist.AllowEntry]) -> int:
-    """自定义白名单匹配，返回 2/1/0，语义同 _match_spec。"""
+    """自定义白名单匹配，返回 2/1/0，语义同 _match_spec（叠加更严的 denied 判断）。"""
+    for entry in entries:
+        if _spec_verdict(toks, CmdSpec(entry.name, denied=set(entry.denied))) == 2:
+            if _custom_denied_hit(toks, entry) is None:
+                return 2
     for entry in entries:
         verdict = _spec_verdict(toks, CmdSpec(entry.name, denied=set(entry.denied)))
-        if verdict == 2:
-            return 2
-    for entry in entries:
-        if _spec_verdict(toks, CmdSpec(entry.name, denied=set(entry.denied))) == 1:
+        if verdict == 1 or _custom_denied_hit(toks, entry) is not None:
             return 1
     return 0
 

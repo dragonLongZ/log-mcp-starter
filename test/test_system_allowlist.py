@@ -100,6 +100,31 @@ class TestHotReload:
         assert entries[0].note == "second"
 
 
+class TestDeniedCannotBeBypassed:
+    """denied 里的长参数必须能拦住组合写法（jmap 导堆就是这类）。"""
+
+    def test_combined_jmap_dump_flags_are_rejected(self):
+        # 现网真实配置：jmap 禁用了 -dump:live / format=b / file= 等
+        system_allowlist.add_entry("jmap", denied=[
+            "-histo:live", "-dump:live", "format=b", "file=", "-dump:format=b", "-F",
+        ])
+        # 单个 token 里拼起来也必须拒绝：否则等于放行 -dump 到文件
+        assert validate_system_info_command(
+            "jmap -dump:live,format=b,file=/tmp/x.bin 1234").verdict == Verdict.REJECTED
+        assert validate_system_info_command(
+            "jmap -dump:format=b,file=/tmp/x.bin 1234").verdict == Verdict.REJECTED
+        assert validate_system_info_command("jmap -histo:live 1234").verdict == Verdict.REJECTED
+        assert validate_system_info_command("jmap -dump:live 1234").verdict == Verdict.REJECTED
+        # 正常只读用法仍然放行
+        assert validate_system_info_command("jmap -histo 1234").verdict == Verdict.ALLOWED
+        assert validate_system_info_command("jmap -h").verdict == Verdict.ALLOWED
+
+    def test_short_flag_still_caught_by_combined_form(self):
+        system_allowlist.add_entry("jstack", denied=["-F"])
+        assert validate_system_info_command("jstack -F 1234").verdict == Verdict.REJECTED
+        assert validate_system_info_command("jstack 1234").verdict == Verdict.ALLOWED
+
+
 class TestRealWorldCommands:
     """真实场景：jcmd 的危险动作是子命令（VM.set_flag/GC.run），不是 flag。"""
 
