@@ -1,27 +1,15 @@
 """自定义命令白名单（system_allowlist）与 system_guard 集成测试。
 
-关键点：白名单文件用临时路径覆盖，绝不写项目的 config/ 目录。
+白名单已并入 SQLite（与资产同库），存储位置由 test/conftest.py 的
+``isolated_store`` 指向临时目录，绝不碰仓库里的 data/ 与 config/。
 """
 from __future__ import annotations
 
-import tempfile
-import uuid
-from pathlib import Path
-
 import pytest
 
+import config_store
 import system_allowlist
 from system_guard import Verdict, validate_system_info_command
-
-
-@pytest.fixture(autouse=True)
-def temp_allowlist():
-    """每个用例使用独立的临时白名单文件，结束后恢复默认路径。"""
-    path = Path(tempfile.gettempdir()) / f"log_mcp_allowlist_{uuid.uuid4().hex}.yaml"
-    system_allowlist.set_path(path)
-    yield path
-    system_allowlist.set_path(None)
-    path.unlink(missing_ok=True)
 
 
 class TestNameValidation:
@@ -104,12 +92,6 @@ class TestHotReload:
         # 只登记了 docker compose ls，docker compose up 仍是未知
         assert validate_system_info_command("docker compose up").verdict == Verdict.UNKNOWN
 
-    def test_manual_file_edit_is_picked_up(self, temp_allowlist):
-        temp_allowlist.write_text(
-            "version: 1\ncommands:\n  - name: 'ifconfig'\n", encoding="utf-8"
-        )
-        assert validate_system_info_command("ifconfig").verdict == Verdict.ALLOWED
-
     def test_entry_update_overrides_previous(self):
         system_allowlist.add_entry("ncdu", note="first")
         entries = system_allowlist.add_entry("ncdu", denied=["-o"], note="second")
@@ -170,29 +152,40 @@ class TestGuardsStillApply:
 
 
 class TestPersistence:
-    def test_written_file_is_valid_yaml(self, temp_allowlist):
-        import yaml
+    """并库后的持久化：数据在 allowlist_entries 表，进程重启（清缓存）后仍在。"""
 
+    def test_entry_survives_cache_invalidate(self):
         system_allowlist.add_entry("htop", denied=["-d"], note="进程查看")
-        data = yaml.safe_load(temp_allowlist.read_text(encoding="utf-8"))
-        assert data["version"] == 1
-        assert data["commands"][0]["name"] == "htop"
-        assert data["commands"][0]["denied"] == ["-d"]
-        assert data["commands"][0]["note"] == "进程查看"
-        assert data["commands"][0]["added_at"]
+        system_allowlist.invalidate()
+        entries = system_allowlist.load_allowlist()
+        assert [entry.name for entry in entries] == ["htop"]
+        assert entries[0].denied == ("-d",)
+        assert entries[0].note == "进程查看"
+        assert entries[0].added_at
 
-    def test_missing_file_means_empty(self, temp_allowlist):
+    def test_stored_in_same_db_as_targets(self):
+        """白名单与资产同库，这是「开源只 gitignore 一个文件」的前提。"""
+        system_allowlist.add_entry("htop")
+        rows = config_store.load_allowlist_rows()
+        assert rows[0]["name"] == "htop"
+        assert system_allowlist.current_path() == config_store.db_path()
+
+    def test_missing_file_means_empty(self):
         assert system_allowlist.load_allowlist() == []
 
-    def test_broken_entry_is_skipped_with_warning(self, temp_allowlist):
-        temp_allowlist.write_text(
-            "version: 1\ncommands:\n  - name: 'htop'\n  - name: 'ps; rm -rf /'\n  - name: 'ifconfig'\n",
-            encoding="utf-8",
-        )
+    def test_broken_entry_is_skipped_with_warning(self):
+        # 绕过 API 直接往库里塞一条非法条目（模拟手工改库/旧数据）
+        config_store.init_db()
+        with config_store.connect() as conn:
+            conn.execute(
+                "INSERT INTO allowlist_entries (name, denied, note, added_at) VALUES (?, ?, '', '')",
+                ("ps; rm -rf /", "[]"),
+            )
+        system_allowlist.invalidate()
         entries = system_allowlist.load_allowlist()
-        assert [entry.name for entry in entries] == ["htop", "ifconfig"]
+        assert entries == []
         assert any("skipped" in warning for warning in system_allowlist.warnings())
 
-    def test_remove_missing_entry_raises(self, temp_allowlist):
+    def test_remove_missing_entry_raises(self):
         with pytest.raises(system_allowlist.AllowlistError):
             system_allowlist.remove_entry("htop")

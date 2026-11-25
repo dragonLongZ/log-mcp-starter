@@ -39,6 +39,58 @@ code{background:#f3f4f6;padding:1px 5px;border-radius:3px;font-size:13px}
 
 <table><thead><tr><th>资产名</th><th>状态</th><th>最后心跳</th><th>断开原因</th><th>操作</th></tr></thead><tbody id="tb"></tbody></table>
 
+<h2>资产配置 <span class="tag" id="tg-count"></span></h2>
+<p class="note">
+  资产与模块保存在网关的 SQLite 数据库里（<code id="tg-db"></code>），<b>保存后立即生效、无需重启</b>：
+  新资产马上出现在上表并可点「连接」，已连接资产只改日志目录不会踢掉会话。<br>
+  「以现有资产为模板」会把该资产的 <code>ssh_username</code> 与全部模块一起填进表单，
+  同一套模块的机器只需要改资产名和用户名。
+</p>
+<div id="tg-msg" class="hidden"></div>
+<div class="form-row">
+  <input id="tg-name" placeholder="资产名，如 server-10.0.0.11-order-api" style="width:300px">
+  <input id="tg-env" placeholder="环境，如 生产 / 测试 / 研发" style="width:160px">
+  <select id="tg-kind" onchange="kindChanged()" style="padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:14px">
+    <option value="linux">Linux 资产</option>
+    <option value="k8s">K8S 资产</option>
+  </select>
+  <select id="tg-copy" onchange="copyFrom(this.value)" style="padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:14px">
+    <option value="">以现有资产为模板…</option>
+  </select>
+</div>
+<div class="form-row">
+  <input id="tg-desc" placeholder="说明（模型用描述判断业务归属，写清楚一点）" style="width:640px">
+</div>
+<div class="form-row">
+  <input id="tg-user" placeholder="ssh_username，如 user#root#10.0.0.11" style="width:340px">
+</div>
+<div class="form-row" id="tg-k8s-row" style="display:none">
+  <input id="tg-k8s-ctx" placeholder="k8s context（仅展示）" style="width:200px">
+  <input id="tg-k8s-ns" placeholder="常用命名空间，逗号分隔（可选）" style="width:340px">
+</div>
+<div id="tg-modules"></div>
+<div class="form-row">
+  <button class="btn-cancel" onclick="addModuleRow()">+ 添加模块</button>
+  <button class="btn-cancel" onclick="validateTarget()">试运行校验</button>
+  <button class="btn-connect" onclick="saveTarget()">保存资产</button>
+  <button class="btn-cancel" onclick="resetTargetForm()">清空表单</button>
+  <span id="tg-valid" class="note"></span>
+</div>
+<table><thead><tr><th>资产名</th><th>环境</th><th>类型</th><th>ssh_username</th><th>模块</th><th>状态</th><th>操作</th></tr></thead><tbody id="tgb"></tbody></table>
+
+<details style="margin-top:1rem">
+  <summary class="note" style="cursor:pointer">批量导入 / 导出（迁移、备份、把配置回灌到 example 文件）</summary>
+  <p class="note">导入内容支持 YAML（含 <code>targets:</code> 段）或 JSON；同一个资产名会整条覆盖。先「试运行」确认没有条目被拒。</p>
+  <textarea id="tg-import" placeholder="把 log_targets.yaml 的内容粘贴到这里…" style="width:100%;height:160px;padding:8px;border:1px solid #ddd;border-radius:6px;font-family:ui-monospace,monospace;font-size:13px;box-sizing:border-box"></textarea>
+  <div class="form-row">
+    <button class="btn-cancel" onclick="importTargets(true)">试运行</button>
+    <button class="btn-connect" onclick="importTargets(false)">导入</button>
+    <a id="tg-export" class="note" href="#" style="margin-left:8px">导出当前完整配置</a>
+    <span id="tg-import-out" class="note"></span>
+  </div>
+  <pre id="tg-import-detail" class="note" style="white-space:pre-wrap"></pre>
+</details>
+
 <h2>自定义命令白名单 <span class="tag" id="al-count"></span></h2>
 <p class="note">
 当 <code>execute_system_query</code> 提示 <b>UNKNOWN</b> 时，说明该命令不在网关内置白/黑名单里。
@@ -132,6 +184,216 @@ async function doConnect(s){
   }catch(e){E(e.message);}
 }
 
+/* ── 资产配置 ───────────────────────────────── */
+var targetCache=[];
+function TG(m,ok){
+  var e=document.getElementById('tg-msg');
+  e.textContent=m;
+  e.style.cssText=ok
+    ?'background:#f0fdf4;color:#15803d;padding:10px;border-radius:6px;margin:8px 0'
+    :'background:#fef2f2;color:#dc2626;padding:10px;border-radius:6px;margin:8px 0';
+  e.classList.remove('hidden');
+  clearTimeout(e._t);
+  e._t=setTimeout(function(){e.classList.add('hidden');},9000);
+}
+function kindChanged(){
+  var k=document.getElementById('tg-kind').value;
+  document.getElementById('tg-k8s-row').style.display=k==='k8s'?'flex':'none';
+}
+function addModuleRow(name,dir,desc){
+  var box=document.getElementById('tg-modules');
+  var row=el('div',null,'form-row tg-mod');
+  var n=el('input');n.className='m-name';n.placeholder='模块名';n.style.width='180px';n.value=name||'';
+  var d=el('input');d.className='m-dir';d.placeholder='日志目录，如 /data/logs/xxx';d.style.width='320px';d.value=dir||'';
+  var s=el('input');s.className='m-desc';s.placeholder='模块说明';s.style.width='260px';s.value=desc||'';
+  var b=el('button','\\u5220\\u9664','btn-danger');
+  b.onclick=function(){row.remove();};
+  row.appendChild(n);row.appendChild(d);row.appendChild(s);row.appendChild(b);
+  box.appendChild(row);
+}
+function clearModules(){document.getElementById('tg-modules').textContent='';}
+function readModules(){
+  var out={},mods=document.querySelectorAll('#tg-modules .tg-mod');
+  var dup=false;
+  mods.forEach(function(row){
+    var n=row.querySelector('.m-name').value.trim();
+    var d=row.querySelector('.m-dir').value.trim();
+    var s=row.querySelector('.m-desc').value.trim();
+    if(!n&&!d)return;
+    if(out[n])dup=true;
+    out[n]={log_dir:d,description:s};
+  });
+  if(dup)throw new Error('\\u6a21\\u5757\\u540d\\u91cd\\u590d');
+  return out;
+}
+function resetTargetForm(){
+  ['tg-name','tg-env','tg-desc','tg-user','tg-k8s-ctx','tg-k8s-ns'].forEach(function(id){
+    document.getElementById(id).value='';
+  });
+  document.getElementById('tg-kind').value='linux';
+  document.getElementById('tg-copy').value='';
+  kindChanged();clearModules();
+  document.getElementById('tg-valid').textContent='';
+}
+function copyFrom(name){
+  var t=null;
+  targetCache.forEach(function(item){if(item.name===name)t=item;});
+  if(!t)return;
+  document.getElementById('tg-env').value=t.env||'';
+  document.getElementById('tg-desc').value=t.description||'';
+  document.getElementById('tg-user').value=t.ssh_username||'';
+  document.getElementById('tg-kind').value=t.kind||'linux';
+  kindChanged();
+  clearModules();
+  Object.keys(t.modules||{}).forEach(function(m){
+    addModuleRow(m,t.modules[m].log_dir,t.modules[m].description);
+  });
+  if(t.k8s){
+    document.getElementById('tg-k8s-ctx').value=t.k8s.context||'';
+    document.getElementById('tg-k8s-ns').value=(t.k8s.namespaces||[]).join(',');
+  }
+  TG('\\u5df2\\u4ee5 '+name+' \\u4e3a\\u6a21\\u677f\\u586b\\u5165\\uff0c\\u8bb0\\u5f97\\u6539\\u8d44\\u4ea7\\u540d\\u4e0e ssh_username',true);
+}
+function targetBody(){
+  var k=document.getElementById('tg-kind').value;
+  return {
+    name:document.getElementById('tg-name').value.trim(),
+    env:document.getElementById('tg-env').value.trim(),
+    description:document.getElementById('tg-desc').value.trim(),
+    kind:k,
+    ssh_username:document.getElementById('tg-user').value.trim(),
+    modules:readModules(),
+    k8s_context:k==='k8s'?document.getElementById('tg-k8s-ctx').value.trim():'',
+    k8s_namespaces:k==='k8s'
+      ? document.getElementById('tg-k8s-ns').value.split(',').map(function(s){return s.trim();}).filter(Boolean)
+      : []
+  };
+}
+async function validateTarget(){
+  var b;
+  try{b=targetBody();}catch(e){TG(e.message,false);return;}
+  var out=document.getElementById('tg-valid');
+  try{
+    var r=await fetch('/dashboard/targets/validate',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify(b)});
+    var d=await r.json();
+    if(d.valid){out.textContent='\\u2705 \\u6821\\u9a8c\\u901a\\u8fc7';out.className='note v-allowed';}
+    else{out.textContent='\\u274c '+d.error;out.className='note v-rejected';}
+  }catch(e){out.textContent=e.message;out.className='note v-rejected';}
+}
+async function saveTarget(){
+  var b;
+  try{b=targetBody();}catch(e){TG(e.message,false);return;}
+  if(!b.name){TG('\\u8bf7\\u586b\\u8d44\\u4ea7\\u540d',false);return;}
+  try{
+    var r=await fetch('/dashboard/targets',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify(b)});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'\\u4fdd\\u5b58\\u5931\\u8d25');
+    resetTargetForm();renderTargets(d);await loadConnections();
+    TG('\\u5df2\\u4fdd\\u5b58 '+b.name+'\\uff0c\\u5df2\\u751f\\u6548\\uff1a\\u53ef\\u76f4\\u63a5\\u5728\\u4e0a\\u8868\\u70b9\\u300c\\u8fde\\u63a5\\u300d',true);
+  }catch(e){TG('\\u4fdd\\u5b58\\u5931\\u8d25\\uff1a'+e.message,false);}
+}
+function editTarget(name){
+  targetCache.forEach(function(t){
+    if(t.name!==name)return;
+    document.getElementById('tg-name').value=t.name;
+    document.getElementById('tg-env').value=t.env||'';
+    document.getElementById('tg-desc').value=t.description||'';
+    document.getElementById('tg-user').value=t.ssh_username||'';
+    document.getElementById('tg-kind').value=t.kind||'linux';
+    kindChanged();clearModules();
+    Object.keys(t.modules||{}).forEach(function(m){
+      addModuleRow(m,t.modules[m].log_dir,t.modules[m].description);
+    });
+    if(t.k8s){
+      document.getElementById('tg-k8s-ctx').value=t.k8s.context||'';
+      document.getElementById('tg-k8s-ns').value=(t.k8s.namespaces||[]).join(',');
+    }
+    window.scrollTo(0,0);
+  });
+}
+async function deleteTarget(name){
+  if(!confirm('\\u5220\\u9664\\u8d44\\u4ea7\\u300c'+name+'\\u300d\\uff1f\\u5176 SSH \\u8fde\\u63a5\\u4f1a\\u88ab\\u5173\\u95ed\\uff0c\\u6a21\\u5757\\u914d\\u7f6e\\u4e00\\u5e76\\u5220\\u9664\\u3002'))return;
+  try{
+    var r=await fetch('/dashboard/targets?name='+encodeURIComponent(name),{method:'DELETE',headers:H()});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'\\u5220\\u9664\\u5931\\u8d25');
+    renderTargets(d);await loadConnections();TG('\\u5df2\\u5220\\u9664\\uff1a'+name,true);
+  }catch(e){TG('\\u5220\\u9664\\u5931\\u8d25\\uff1a'+e.message,false);}
+}
+async function toggleTarget(name,enabled){
+  try{
+    var r=await fetch('/dashboard/targets/enabled',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify({name:name,enabled:enabled})});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'\\u64cd\\u4f5c\\u5931\\u8d25');
+    renderTargets(d);await loadConnections();
+    TG((enabled?'\\u5df2\\u542f\\u7528\\uff1a':'\\u5df2\\u505c\\u7528\\uff1a')+name,true);
+  }catch(e){TG(e.message,false);}
+}
+function renderTargets(d){
+  targetCache=d.targets||[];
+  document.getElementById('tg-count').textContent='共 '+targetCache.length+' 个资产';
+  document.getElementById('tg-db').textContent=d.db_path||'';
+  document.getElementById('tg-export').href='/dashboard/targets/export?token='+encodeURIComponent(T);
+  var sel=document.getElementById('tg-copy');
+  var cur=sel.value;
+  sel.textContent='';
+  sel.appendChild(el('option','\\u4ee5\\u73b0\\u6709\\u8d44\\u4ea7\\u4e3a\\u6a21\\u677f\\u2026'));
+  sel.firstChild.value='';
+  targetCache.forEach(function(t){
+    var o=el('option',t.name);o.value=t.name;sel.appendChild(o);
+  });
+  sel.value=cur||'';
+
+  var tb=document.getElementById('tgb');tb.textContent='';
+  if(!targetCache.length){
+    var tr0=el('tr'),td0=el('td','\\u6682\\u65e0\\u8d44\\u4ea7\\uff0c\\u4e0a\\u65b9\\u586b\\u4e00\\u4e2a\\u540e\\u70b9\\u300c\\u4fdd\\u5b58\\u8d44\\u4ea7\\u300d\\u3002','note');
+    td0.colSpan=7;tr0.appendChild(td0);tb.appendChild(tr0);return;
+  }
+  targetCache.forEach(function(t){
+    var tr=el('tr');
+    tr.appendChild(el('td',t.name));
+    tr.appendChild(el('td',t.env||'\\u2014'));
+    tr.appendChild(el('td',t.kind==='k8s'?'K8S':'Linux'));
+    tr.appendChild(el('td',t.ssh_username||'\\u2014'));
+    var mods=Object.keys(t.modules||{});
+    tr.appendChild(el('td',mods.length?mods.join(', '):'\\u2014'));
+    var st=t.enabled?(t.connection?lookup(t.connection.state):'\\u672a\\u8fde\\u63a5'):'\\u5df2\\u505c\\u7528';
+    tr.appendChild(el('td',st,t.enabled?(t.connection?t.connection.state:''):'disconnected'));
+    var td=el('td');
+    var eb=el('button','\\u7f16\\u8f91','btn-cancel');eb.onclick=function(){editTarget(t.name);};
+    td.appendChild(eb);
+    var tb2=el('button',t.enabled?'\\u505c\\u7528':'\\u542f\\u7528','btn-cancel');
+    tb2.onclick=function(){toggleTarget(t.name,!t.enabled);};
+    td.appendChild(tb2);
+    var db2=el('button','\\u5220\\u9664','btn-danger');db2.onclick=function(){deleteTarget(t.name);};
+    td.appendChild(db2);
+    tr.appendChild(td);tb.appendChild(tr);
+  });
+}
+async function loadTargets(){
+  try{
+    var r=await fetch('/dashboard/targets',{headers:H()});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'\\u52a0\\u8f7d\\u5931\\u8d25');
+    renderTargets(d);
+    if(d.warnings&&d.warnings.length)TG('\\u914d\\u7f6e\\u544a\\u8b66\\uff1a'+d.warnings.join('\\uff1b'),false);
+  }catch(e){TG('\\u52a0\\u8f7d\\u8d44\\u4ea7\\u5931\\u8d25\\uff1a'+e.message,false);}
+}
+async function importTargets(dry){
+  var content=document.getElementById('tg-import').value;
+  var out=document.getElementById('tg-import-out');
+  var detail=document.getElementById('tg-import-detail');
+  if(!content.trim()){out.textContent='\\u8bf7\\u5148\\u7c98\\u8d34\\u5185\\u5bb9';return;}
+  try{
+    var r=await fetch('/dashboard/targets/import',{method:'POST',headers:H({'Content-Type':'application/json'}),body:JSON.stringify({content:content,dry_run:!!dry})});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'\\u5bfc\\u5165\\u5931\\u8d25');
+    out.textContent=(dry?'\\u8bd5\\u8fd0\\u884c\\uff1a':'\\u5df2\\u5bfc\\u5165\\uff1a')+'\\u63a5\\u53d7 '+d.accepted.length+' \\u6761\\uff0c\\u62d2\\u7edd '+d.rejected.length+' \\u6761';
+    detail.textContent=(d.rejected||[]).map(function(x){return '\\u2717 '+x.name+'\\uff1a'+x.error;}).join('\\n');
+    if(!dry){await loadTargets();await loadConnections();}
+  }catch(e){out.textContent=e.message;detail.textContent='';}
+}
+
 /* ── 自定义命令白名单 ───────────────────────── */
 function renderAllowlist(entries){
   var tb=document.getElementById('alb');tb.textContent='';
@@ -157,7 +419,7 @@ async function loadAllowlist(){
     var d=await r.json();
     if(!r.ok)throw new Error(d.detail||'\\u52a0\\u8f7d\\u5931\\u8d25');
     renderAllowlist(d.entries||[]);
-    document.getElementById('al-path').textContent='配置文件：'+(d.path||'')+(d.warnings&&d.warnings.length?('　⚠ '+d.warnings.join('; ')):'');
+    document.getElementById('al-path').textContent='存储位置（与资产同库）：'+(d.path||'')+(d.warnings&&d.warnings.length?('　⚠ '+d.warnings.join('; ')):'');
   }catch(e){AE('\\u52a0\\u8f7d\\u767d\\u540d\\u5355\\u5931\\u8d25\\uff1a'+e.message,false);E(e.message);}
 }
 async function addEntry(){
@@ -196,5 +458,6 @@ async function checkCmd(){
 loadConnections();
 setInterval(loadConnections,10000);
 loadAllowlist();
+loadTargets();
 </script>
 </body></html>"""

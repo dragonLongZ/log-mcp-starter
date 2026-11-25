@@ -4,3 +4,11 @@ __pycache__/
 local.token
 .env
 dsh-plugins/log-context/.token
+
+# 运行时数据库（资产 / 自定义命令白名单 / 审计）——不进版本库
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# 首次启动从旧 YAML 迁移时留下的备份
+config/log_targets.yaml.migrated
