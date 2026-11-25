@@ -111,10 +111,59 @@ try {
   if (offline.catalogSource !== 'local-yaml') throw new Error('离线时应回退到本地 YAML')
   if (offline.assets.length === 0) throw new Error('离线时不应丢失资产列表')
 
-  // 4) 默认配置：projectDir 指向项目根，tokenPath 默认 local.token
-  const defaults = internals.resolveSettings({})
-  if (!defaults.tokenPath.endsWith('local.token')) throw new Error('默认 token 路径不正确')
-  console.log('OK 默认配置: projectDir =', defaults.projectDir)
+  // 4) 默认配置：settings.json 优先，其次 patch config，最后默认值
+  // 注意：必须传临时设置文件，否则会读到用户真实保存的 ~/.dsh/log-context/settings.json。
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const settingsMod = await import('./settings.js')
+  const tmpHome = fs.mkdtempSync(join(os.tmpdir(), 'log-context-'))
+  const settingsFile = join(tmpHome, 'log-context', 'settings.json')
+
+  const defaults = internals.resolveSettings({}, settingsFile)
+  console.log('OK 默认配置: gateway =', defaults.gatewayBaseUrl, '| token 来源 =', defaults.source.token)
+  if (defaults.gatewayBaseUrl !== 'http://127.0.0.1:8765') throw new Error('默认网关地址不正确')
+  if (defaults.mcpUrl !== 'http://127.0.0.1:8000/mcp') throw new Error('默认 MCP 地址不正确')
+
+  // 4a) 用户保存的设置优先于 patch config（这是「右栏可配」的核心）
+  settingsMod.writeSettings(
+    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://10.0.0.9:8000/mcp', token: 'tok-from-settings' },
+    settingsFile,
+  )
+  const saved = internals.resolveSettings(
+    { gatewayBaseUrl: 'http://should-be-ignored:1', tokenPath: '/nonexistent/.token' },
+    settingsFile,
+  )
+  if (saved.gatewayBaseUrl !== FAKE_BASE) throw new Error('设置文件里的网关地址未优先生效')
+  if (saved.mcpUrl !== 'http://10.0.0.9:8000/mcp') throw new Error('设置文件里的 MCP 地址未生效')
+  if (saved.token !== 'tok-from-settings') throw new Error('设置文件里的 token 未生效')
+  console.log('OK 设置优先:', saved.gatewayBaseUrl, '| mcp =', saved.mcpUrl, '| token 来源 =', saved.source.token)
+
+  // 4b) token 不回明文，只回掩码
+  const described = internals.describeSettings(saved)
+  if (described.hasToken !== true) throw new Error('hasToken 应为 true')
+  if (String(described.tokenMasked).includes('tok-from-settings')) throw new Error('掩码泄露了完整 token')
+  if (!described.tokenMasked.includes('***')) throw new Error('掩码格式不正确')
+  console.log('OK token 掩码:', described.tokenMasked)
+
+  // 4c) 设置文件损坏时回落到 patch config，不抛错
+  fs.writeFileSync(settingsFile, '{ this is not json', 'utf8')
+  const broken = internals.resolveSettings({ gatewayBaseUrl: 'http://from-patch:8765' }, settingsFile)
+  if (broken.gatewayBaseUrl !== 'http://from-patch:8765') throw new Error('设置损坏时未回落到 patch')
+  console.log('OK 设置损坏回落:', broken.gatewayBaseUrl)
+
+  // 4d) URL 校验拒绝非法值
+  for (const bad of ['', 'ftp://x', 'not-a-url']) {
+    let threw = false
+    try {
+      settingsMod.normalizeUrl(bad, '网关地址')
+    } catch {
+      threw = true
+    }
+    if (!threw) throw new Error(`非法地址未被拒绝：${bad}`)
+  }
+  console.log('OK URL 校验拒绝非法值')
+
+  fs.rmSync(tmpHome, { recursive: true, force: true })
 
   // 5) MCP 状态与手动重连（伪造 tools / loader 服务，不触碰真实运行时）
   const missing = internals.mcpStatus({ get: () => undefined })

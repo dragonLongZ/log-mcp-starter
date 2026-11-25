@@ -1,25 +1,30 @@
 # log-context bundle patch.
 #
-# 部署形态：本项目按 README 的「远程部署」运行 —— gateway_host.py 与 mcp_server.py 都在
-# 10.12.0.101 上（8000 = MCP，8765 = gateway），token 是该机器上的 local.token。
-# 本机（Windows）只跑 DSH；插件通过 HTTP 访问这台服务器。
+# 连接信息（网关地址 / MCP 地址 / token）优先从「用户保存的设置」读取：
+#
+#     $DSH_HOME/log-context/settings.json      （未设 DSH_HOME 时为 ~/.dsh/log-context/settings.json）
+#
+# 在右栏「日志上下文」→「连接设置」里填好并保存后**立即生效**：
+# 不需要改本文件，也不需要重装 bundle。下面的 `url` / `gatewayBaseUrl` / 兜底 token
+# 路径只是出厂默认值，设置文件里没有对应字段时才会用到。
+#
+# `!!js` 表达式由 Loader 在插件上下文中求值，可以用 Node 内置模块，
+# 因此这里能动态算出绝对路径（不受工作目录影响）。
 #
 # 行说明：
 # - log-context-mcp: 复用已有 mcp_server.py，模型拿到 mcp__logmcp__* 工具。
-#   token 在挂载时从插件目录下的 .token 读取（该文件已被 .gitignore 忽略）；
-#   文件缺失时降级为显式 "Bearer missing-token"，不会让 profile 加载失败。
 # - log-context: 插件 Host + Client 两半（catalog 接口、系统提示、右栏标签页）。
-#
-# 换机器 / 换端口 / 换 token 时只改下面三处：url、gatewayBaseUrl、.token 文件内容。
 - insert:
     - id: log-context-mcp
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: logmcp
         transport: streamable-http
-        url: 'http://10.12.0.101:8000/mcp'
+        # 默认值；真正的地址优先取 settings.json 的 mcpUrl。
+        url: !!js '(function(){try{var fs=process.getBuiltinModule("node:fs"),os=process.getBuiltinModule("node:os"),pa=process.getBuiltinModule("node:path");var h=String(process.env.DSH_HOME||"").trim()||pa.join(os.homedir(),".dsh");var s=JSON.parse(fs.readFileSync(pa.join(h,"log-context","settings.json"),"utf8"));return (s&&s.mcpUrl)||"http://127.0.0.1:8000/mcp"}catch(e){return "http://127.0.0.1:8000/mcp"}})()'
+        # token 同理：settings.json 优先，其次是插件目录下的 .token（兼容旧安装）。
         headers:
-          Authorization: !!js '(function(){try{return "Bearer " + process.getBuiltinModule("node:fs").readFileSync("D:/pythonProject/log-mcp-starter/dsh-plugins/log-context/.token","utf8").trim()}catch(e){return "Bearer missing-token"}})()'
+          Authorization: !!js '(function(){try{var fs=process.getBuiltinModule("node:fs"),os=process.getBuiltinModule("node:os"),pa=process.getBuiltinModule("node:path");var h=String(process.env.DSH_HOME||"").trim()||pa.join(os.homedir(),".dsh");var s=JSON.parse(fs.readFileSync(pa.join(h,"log-context","settings.json"),"utf8"));var t=String((s&&s.token)||"").trim();if(t)return "Bearer "+t;}catch(e){}try{var fs2=process.getBuiltinModule("node:fs"),pa2=process.getBuiltinModule("node:path");var f2=process.env.DSH_LOG_CONTEXT_TOKEN_FILE||pa2.join(process.cwd(),"dsh-plugins","log-context",".token");var t2=fs2.readFileSync(f2,"utf8").trim();return t2?("Bearer "+t2):"Bearer missing-token";}catch(e2){return "Bearer missing-token"}})()'
         failOnStartupError: false
         # 默认 10 次重连在 VPN / 网络未就绪时会很快烧完，随后工具被移除、需要重载插件。
         # 这里放大预算，给开机/重连 VPN 留足时间（≈ 最多 1 小时，30s 封顶）。
@@ -31,6 +36,7 @@
     - id: log-context
       name: '@local/dsh-log-context'
       config:
+        # 只是默认值；右栏「连接设置」保存后会覆盖。
+        # projectDir 用于本地 YAML 兜底与默认 token 文件位置，留空则用插件所在项目根。
         projectDir: 'D:/pythonProject/log-mcp-starter'
-        gatewayBaseUrl: 'http://10.12.0.101:8765'
-        tokenPath: 'D:/pythonProject/log-mcp-starter/dsh-plugins/log-context/.token'
+        gatewayBaseUrl: 'http://127.0.0.1:8765'

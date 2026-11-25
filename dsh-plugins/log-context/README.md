@@ -46,22 +46,22 @@ Host 半**不改动** Python 侧业务逻辑，只读取配置并调用 gateway 
 
 ## 部署形态
 
-本项目按 README 的「远程部署」使用：`gateway_host.py` 和 `mcp_server.py` 都跑在 **10.12.0.101** 上，
+本项目按 README 的「远程部署」使用：`gateway_host.py` 和 `mcp_server.py` 都跑在服务器上（示例为 **10.12.0.101**），
 
-| 服务 | 地址 | 用途 |
+| 服务 | 地址（示例） | 用途 |
 |---|---|---|
 | MCP | `http://10.12.0.101:8000/mcp` | 模型侧 `mcp__logmcp__*` 工具 |
 | gateway | `http://10.12.0.101:8765` | 资产配置、连接状态、kubectl 只读查询 |
 
-Windows 本机只跑 DSH。两处地址都写在 [cordis.patch.yml](cordis.patch.yml) 里，换机器只改那里。
+实际地址在右栏「连接设置」里填，不用改文件。
+
+Windows 本机只跑 DSH。地址与 token 都**不用改文件**：在右栏「日志上下文」→「连接设置」里填。
 
 ## 前置条件
 
 1. **远程** 10.12.0.101 上 `gateway_host.py` 与 `mcp_server.py` 都在运行，且 gateway 里已完成 JumpServer 认证
    （未认证的资产在面板里显示「未连接」，点「重连」会触发对应资产重新认证，密码 / MFA 在 gateway 终端完成）。
-2. 本插件目录下的 `.token` 文件存在，内容是该服务器上的 `local.token`
-   （**注意**：和仓库根目录的 `local.token` 不是同一份，那个可能是本机旧 token）。
-   `.token` 已被 `.gitignore` 忽略，不会进 git。
+2. 手上有该服务器上的 `local.token` 内容（网关与 MCP 共用同一把）。
 3. profile 里安装了本 bundle（见下）。
 
 右栏顶部圆点表示 gateway 状态；资产行左侧圆点表示该资产的 SSH 连接状态，未连接时可点「重连」。
@@ -76,14 +76,27 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
 
 安装后即可在右栏看到标签页，输入框左侧也会出现「日志上下文」按钮。
 
-> 改了 `cordis.patch.yml`（地址 / token）之后，需要 `remove_bundle` 再 `install_bundle` 一次，
-> 或重启 DSH，新的行配置才会重新应用。
-
 ## 配置
 
-### 插件行
+### 在右栏配（推荐）
 
-`cordis.patch.yml` 里的两行：
+打开右栏「日志上下文」→ 点「连接设置」→「配置」，填三项后 **保存**：
+
+| 字段 | 说明 | 示例 |
+|---|---|---|
+| 网关地址 | 资产目录、连接状态、kubectl 只读查询 | `http://10.12.0.101:8765` |
+| MCP 地址 | 模型侧 `mcp__logmcp__*` 工具 | `http://10.12.0.101:8000/mcp` |
+| 访问令牌 | `local.token` 的内容 | `_TKs0MDWIb...` |
+
+- 「试连」只发一次 `GET /health`，**不落盘**，用于先验证再保存。
+- 保存后**立即生效**：Host 半每次请求都重新读设置；MCP 行会自动重启一次，让新地址与新 token 生效。
+- token 输入框**留空表示保持不变**；界面上只显示掩码（如 `tok-***3456`），永远不回明文。
+- 保存位置：`$DSH_HOME/log-context/settings.json`（未设 `DSH_HOME` 时为 `~/.dsh/log-context/settings.json`）。
+  放在 DSH home 而不是仓库目录，因为里面有 token，不能进 git；这也让**别人 clone 仓库后不用改任何文件**就能连自己的网关。
+
+### 文件里配（可选，作为默认值）
+
+`cordis.patch.yml` 里的两行仍然可以用，但只作为**出厂默认值**：`settings.json` 里没有对应字段时才生效。
 
 ```yaml
 - id: log-context-mcp
@@ -91,9 +104,9 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
   config:
     serverName: logmcp
     transport: streamable-http
-    url: 'http://10.12.0.101:8000/mcp'
+    url: !!js '…读 settings.json 的 mcpUrl，读不到用 http://127.0.0.1:8000/mcp…'
     headers:
-      Authorization: !!js '…从 dsh-plugins/log-context/.token 读取…'
+      Authorization: !!js '…读 settings.json 的 token，读不到回退 .token 文件…'
     failOnStartupError: false
     reconnect:
       enabled: true
@@ -103,13 +116,12 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
 - id: log-context
   name: '@local/dsh-log-context'
   config:
-    projectDir: 'D:/pythonProject/log-mcp-starter'
-    gatewayBaseUrl: 'http://10.12.0.101:8765'
-    tokenPath: 'D:/pythonProject/log-mcp-starter/dsh-plugins/log-context/.token'
+    projectDir: 'D:/pythonProject/log-mcp-starter'   # 仅用于本地 YAML 兜底与默认 token 文件位置
+    gatewayBaseUrl: 'http://127.0.0.1:8765'          # 出厂默认值，会被 settings.json 覆盖
 ```
 
-换服务器 / 端口 / token 时改这三处：`url`、`gatewayBaseUrl`、`.token` 文件内容。
-`projectDir` 只在本地 YAML 需要作为离线兜底时使用；在线时资产目录以服务器 `/targets` 为准。
+> `!!js` 表达式由 Loader 在插件上下文中求值，因此能动态算出绝对路径，不受工作目录影响。
+> 改动这段仍然需要 `remove_bundle` + `install_bundle`（或重启 DSH）；**改地址/token 则不需要**——走右栏保存即可。
 
 ### log_targets.yaml 的可选字段
 
@@ -156,11 +168,12 @@ targets:
 | 现象 | 处理 |
 |---|---|
 | 右栏没有「日志上下文」 | 确认 bundle 已安装且行状态为 enabled；刷新页面（不是新开标签，是重载当前页面） |
-| 面板顶部圆点是红色 | gateway 不可达或 token 不匹配：先 `Test-NetConnection 10.12.0.101 -Port 8765`，再核对 `.token` 是不是服务器上的 `local.token` |
+| 面板顶部圆点是红色 | gateway 不可达或 token 不匹配：先在「连接设置」点「试连」看具体报错，再 `Test-NetConnection <你配的主机> -Port 8765` |
 | 面板里资产显示「未连接」 | 该资产在 gateway 侧还没认证：点资产行的「重连」，到 gateway 终端完成密码 / MFA |
-| 模型没有 `mcp__logmcp__*` 工具 | 先点面板标题栏的 **重连 MCP**（或让模型调用 `log_context_mcp_restart`）；仍不行再查 `Test-NetConnection 10.12.0.101 -Port 8000`、token 是否 401 |
+| 模型没有 `mcp__logmcp__*` 工具 | 先点面板标题栏的 **重连 MCP**（或让模型调用 `log_context_mcp_restart`）；仍不行再确认「连接设置」里的 MCP 地址与 token |
 | 工具一开始有、重启后消失 | 启动时 VPN / 网络未就绪，MCP 客户端重连预算耗尽后会移除工具并停止重连：点 **重连 MCP** 即可恢复（本 patch 也把 `maxAttempts` 调到了 120 兜底） |
-| 改完 `cordis.patch.yml`（地址 / token）没生效 | 行配置只在重新挂载时读取：`remove_bundle` + `install_bundle`，或重启 DSH |
+| 改了右栏「连接设置」没生效 | Host 半立即生效；MCP 行已自动重启。若仍不生效，点标题栏 **重连 MCP** |
+| 改完 `cordis.patch.yml` 没生效 | 那是**默认值**配置，行配置只在重新挂载时读取：`remove_bundle` + `install_bundle`，或重启 DSH |
 | K8S「拉取」报 `UNKNOWN` / 被拒绝 | 该资产未连接，或 `kubectl` 只读命令被 `system_guard.py` 拦截；先把资产连上再拉 |
 | 提示「未知方法」 | Client / Host 版本不一致，重新安装 bundle |
 
@@ -168,9 +181,11 @@ targets:
 
 ```powershell
 cd D:\pythonProject\log-mcp-starter
-node dsh-plugins/log-context/check-client.mjs   # Client 半：语法 + 注册 + 渲染 + 提示词（无网络）
-node dsh-plugins/log-context/check-host.mjs     # Host 半：假 gateway 验证 catalog/状态合并/离线降级（无网络）
-node dsh-plugins/log-context/check-live.mjs     # 联调：真实访问 10.12.0.101，只读（可设 LOG_CONTEXT_GATEWAY 覆盖地址）
+node dsh-plugins/log-context/check-client.mjs    # Client 半：语法 + 注册 + 渲染 + 提示词（无网络）
+node dsh-plugins/log-context/check-host.mjs      # Host 半：假 gateway 验证 catalog/状态合并/离线降级（无网络）
+node dsh-plugins/log-context/check-settings.mjs  # 连接设置：保存/试连/掩码/损坏降级（无网络）
+.venv\Scripts\python dsh-plugins/log-context/check-patch.py   # patch 里的 !!js 表达式能解析且求值正确
+node dsh-plugins/log-context/check-live.mjs      # 联调：真实访问 gateway，只读（可设 LOG_CONTEXT_GATEWAY 覆盖地址）
 ```
 
 改了 `client.js` 之后需要刷新页面（本 profile 没有跑 `dev:web` 时 HMR 不会自动重建客户端包）；
