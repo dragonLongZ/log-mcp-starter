@@ -1,8 +1,13 @@
 # 部署设置示例 —— 复制为 config/settings.yaml 后按需修改。
 #
-# 这里只放部署期常量（跳板机地址、监听端口、心跳、日志时区）。
-# 资产与自定义命令白名单在运行时数据库里（见 storage.db_path），由网页 /dashboard 维护，
-# 数据库文件本身不进版本库。
+#     cp config/settings.example.yaml config/settings.yaml
+#
+# config/settings.yaml 已被 .gitignore 忽略：它含内网域名/地址，属于本地部署配置，
+# 不该进版本库。缺少这个文件时 gateway 会直接报错并指向本示例。
+#
+# 这里只放"改一次要 review"的部署期常量：跳板机地址、监听端口、心跳、日志时区。
+# 资产（targets）与自定义命令白名单在运行时数据库里（默认 data/logmcp.db，
+# 同样已被 .gitignore 忽略），由网页仪表盘 /dashboard 维护。
 
 jumpserver:
   host: "jumpserver.example.com"
@@ -10,21 +15,27 @@ jumpserver:
   # 仅监听本机时用 127.0.0.1；要让别人访问网页仪表盘才改成 0.0.0.0（务必配合防火墙）。
   bind_host: "127.0.0.1"
   bind_port: 8765
-  # 启动时自动发起认证的资产名列表（可选）。
+  # 可选：gateway 启动时自动发起认证的资产列表（默认空，按需通过 reconnect_asset 手动触发）。
   auto_connect: []
-  # 应用层心跳间隔（分钟，1-60）。
+  # 可选：应用层心跳间隔（分钟，1-60），须显著小于 JumpServer 空闲超时（约 2 小时）。
   keepalive_interval_minutes: 25
 
+# 可选：streamable HTTP MCP 服务器绑定地址与端口。
+# 仅 mcp_server.py（非 gateway）使用；gateway 仍走 jumpserver.bind_*。
 mcp_server:
   bind_host: "0.0.0.0"
   bind_port: 8000
 
+# 用于解释 today/yesterday 及展示文件修改时间的时区。
+# 不强制任何文件名规范。放在这里而不是网页：改错会让所有日期偏一天。
 log_timezone: "Asia/Shanghai"
 
+# 运行时数据库（资产 + 自定义白名单 + 审计）。
+# 相对路径按仓库根目录解析；systemd 部署建议改成绝对路径（如 /var/lib/logmcp/logmcp.db）。
 storage:
-  # 相对路径按仓库根解析；systemd 建议用绝对路径，如 /var/lib/logmcp/logmcp.db
   db_path: "data/logmcp.db"
 
+# 网页写操作开关：没有它，页面只能看状态、不能增删资产。
+# 网关可能监听 0.0.0.0，开关关闭时所有写接口返回 403。
 dashboard:
-  # 关掉后网页只能查看状态，所有写接口返回 403。
   write_enabled: true

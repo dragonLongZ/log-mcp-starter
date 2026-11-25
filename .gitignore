@@ -10,5 +10,10 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
-# 首次启动从旧 YAML 迁移时留下的备份
+# 本机部署设置（含内网域名/地址）——只提交 config/settings.example.yaml
+config/settings.yaml
+
+# 旧版资产配置（含真实内网 IP / 用户名）——只提交 config/log_targets.example.yaml
+config/log_targets.yaml
+config/log_targets.yaml.bak
 config/log_targets.yaml.migrated

@@ -31,6 +31,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = ROOT / "config" / "settings.yaml"
+EXAMPLE_SETTINGS_PATH = ROOT / "config" / "settings.example.yaml"
 LEGACY_TARGETS_PATH = ROOT / "config" / "log_targets.yaml"
 LEGACY_ALLOWLIST_PATH = ROOT / "config" / "system_allowlist.yaml"
 EXAMPLE_TARGETS_PATH = ROOT / "config" / "log_targets.example.yaml"
@@ -380,16 +381,22 @@ def validate_target(name: Any, target: Any) -> dict[str, Any]:
 # 读：settings.yaml + DB → 旧版 dict 形状
 # ---------------------------------------------------------------------------
 def load_settings() -> dict[str, Any]:
+    """读取部署设置；缺失时给出「复制示例文件」的可操作提示。"""
     path = settings_path()
     if not path.exists():
         raise RuntimeError(
-            f"Missing {path.name}. Expected deployment settings (jumpserver host/port, "
-            "bind addresses, log_timezone). See config/settings.example.yaml."
+            f"缺少部署设置文件 {path}。\n"
+            "首次使用请先复制示例并按需修改：\n"
+            f"    cp {EXAMPLE_SETTINGS_PATH} {path}\n"
+            "至少需要 jumpserver.host；其余（bind_*、keepalive、log_timezone、storage）可沿用示例值。"
         )
     with path.open("r", encoding="utf-8") as handle:
         settings = yaml.safe_load(handle) or {}
     if not isinstance(settings, dict) or "jumpserver" not in settings:
-        raise RuntimeError(f"Invalid deployment settings: {path}")
+        raise RuntimeError(
+            f"部署设置文件 {path} 格式不对：顶层必须是映射且包含 jumpserver 段。"
+            f"可参照 {EXAMPLE_SETTINGS_PATH}。"
+        )
     return settings
 
 

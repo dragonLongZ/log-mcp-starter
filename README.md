@@ -16,10 +16,15 @@
 
 | 文件 | 内容 | 维护方式 | 进版本库 |
 |---|---|---|---|
-| `config/settings.yaml` | 部署设置：JumpServer 地址/端口、监听地址、心跳间隔、日志时区、DB 路径、网页写开关 | 手工编辑，改完重启 gateway | ✅ |
+| `config/settings.yaml` | 部署设置：JumpServer 地址/端口、监听地址、心跳间隔、日志时区、DB 路径、网页写开关 | 手工编辑，改完重启 gateway | ❌（含内部域名，已 gitignore） |
 | `data/logmcp.db` | 运行期数据：资产、模块、自定义命令白名单、审计 | **网页仪表盘 `/dashboard` 增删改** | ❌（已 gitignore） |
 
-`config/settings.example.yaml` 与 `config/log_targets.example.yaml` 是给开源使用者看的字段示例。
+仓库里只有 `config/settings.example.yaml` 与 `config/log_targets.example.yaml` 两个示例。**首次使用先复制**：
+
+```bash
+cp config/settings.example.yaml config/settings.yaml
+# 然后按需修改 host / bind_* / storage.db_path
+```
 
 ```yaml
 # config/settings.yaml
@@ -43,6 +48,8 @@ dashboard:
 **为什么 DB 而不是 YAML**：网页要支持增/改/删，整文件重写既会吃掉注释，也会让两个标签页互相覆盖；SQLite 提供行级校验（一条脏数据只跳过它自己，不会让整个网关 500）、事务、审计，而 `sqlite3` 是标准库、零新增依赖。开源仓库只需 gitignore 一个数据库文件。
 
 **从旧版迁移**（BREAKING）：首次启动会自动把旧的 `config/log_targets.yaml` 与 `config/system_allowlist.yaml` 导入数据库，并重命名为 `.migrated` 保留备份。迁移是幂等的，重复启动不会覆盖你后来的修改。回滚方式：仪表盘「导出」→ 把内容存回 `config/log_targets.yaml` → 回退代码版本。
+
+> 注意：`config/log_targets.yaml`、`.bak`、`.migrated` 也已 gitignore——它们含真实内网 IP 与 JumpServer 用户名，属于本机数据。开源仓库里只有 `.example.yaml`。
 
 
 ## MCP 工具
@@ -149,8 +156,7 @@ dashboard:
 
 1. **能力**：bundle patch 插入 `@deepseek-ai/dsh-mcp-client`，连本项目的 `mcp_server.py`，
    模型拿到 `mcp__logmcp__*` 工具；并追加一段系统提示，看到「【日志上下文】」块就直接按块内坐标查询。
-2. **交互**：Host 半读 gateway `/targets`（本地 `config/log_targets.yaml` 仅作可选补充，缺失时自动降级）并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页
-   与输入框左侧入口按钮。
+2. **交互**：Host 半读 gateway `/targets`（本地 `config/log_targets.yaml` 仅作可选补充，缺失时自动降级）并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页与输入框左侧入口按钮。
 
 安装（DSH 会话里执行）：
 

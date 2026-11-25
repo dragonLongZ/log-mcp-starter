@@ -272,10 +272,33 @@ class TestLegacyAllowlistMigration:
 
 
 class TestSettings:
-    def test_missing_settings_is_readable_error(self):
+    def test_missing_settings_gives_copy_hint(self):
+        """settings.yaml 不进版本库，首次使用必须先复制示例：报错要能指导这一步。"""
         config_store.set_paths(settings=config_store.db_path().parent / "nope.yaml")
-        with pytest.raises(RuntimeError, match="settings"):
+        with pytest.raises(RuntimeError) as excinfo:
             config_store.load_settings()
+        message = str(excinfo.value)
+        assert "settings.example.yaml" in message
+        assert "cp " in message
+        assert "jumpserver.host" in message
+
+    def test_example_settings_is_valid_and_has_no_internal_host(self):
+        """示例文件必须能直接跑，且不能泄露真实内网域名。"""
+        example = config_store.EXAMPLE_SETTINGS_PATH
+        raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+        assert "jumpserver" in raw and raw["jumpserver"]["host"]
+        assert "." in raw["jumpserver"]["host"]
+        text = example.read_text(encoding="utf-8")
+        for leaked in ("cheyifu", "10.12.0.101", "172.26."):
+            assert leaked not in text, f"示例文件不应包含内网标识：{leaked}"
+        # 复制成 settings.yaml 后应当能被正常加载
+        import shutil
+
+        target = config_store.db_path().parent / "settings.yaml"
+        shutil.copy(example, target)
+        config_store.set_paths(settings=target)
+        loaded = config_store.load_settings()
+        assert loaded["jumpserver"]["keepalive_interval_minutes"] == 25
 
     def test_keepalive_out_of_range_is_rejected_by_gateway(self):
         import gateway_host
