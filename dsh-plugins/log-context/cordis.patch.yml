@@ -36,7 +36,7 @@
     - id: log-context
       name: '@local/dsh-log-context'
       config:
-        # 只是默认值；右栏「连接设置」保存后会覆盖。
-        # projectDir 用于本地 YAML 兜底与默认 token 文件位置，留空则用插件所在项目根。
-        projectDir: 'D:/pythonProject/log-mcp-starter'
+        # 留空 = 用「插件所在目录」推断项目根，因此别人安装到任意路径都能用，
+        # 不需要改这一行。只有想指向另一个仓库的 log_targets.yaml 时才填绝对路径。
+        # 真正的连接信息（网关/MCP 地址、token）在右栏「连接设置」里配。
         gatewayBaseUrl: 'http://127.0.0.1:8765'

@@ -559,7 +559,9 @@ async function loadCatalog(settings) {
       loaded = {
         configFile: join(settings.projectDir, DEFAULT_CONFIG_FILE),
         raw: {},
+        // 只在 gateway 也拿不到目录时才值得提示；否则（正常情况）不该报错。
         warning: error.message,
+        warningCode: error.code,
       }
     } else {
       throw error
@@ -568,6 +570,8 @@ async function loadCatalog(settings) {
   const gateway = await probeGateway(settings)
   const localTargets = (loaded.raw && loaded.raw.targets) || {}
   const remoteTargets = gateway.targets && typeof gateway.targets === 'object' ? gateway.targets : null
+  // gateway 可用时本地 YAML 只是可选补充，它缺失不算问题，不要污染面板。
+  const configWarning = remoteTargets ? null : (loaded.warning ?? null)
   const entries = []
   /** 把 gateway 条目里的展示字段转成 buildCatalog 需要的 optional 形状。 */
   const optionalFromRemote = (target) => {
@@ -616,7 +620,7 @@ async function loadCatalog(settings) {
     configFile: loaded.configFile,
     tokenFile: settings.tokenPath,
     catalogSource: remoteTargets ? 'gateway' : 'local-yaml',
-    configWarning: loaded.warning ?? null,
+    configWarning,
     timezone: String(loaded.raw.log_timezone ?? 'Asia/Shanghai'),
     gateway: {
       baseUrl: settings.gatewayBaseUrl,

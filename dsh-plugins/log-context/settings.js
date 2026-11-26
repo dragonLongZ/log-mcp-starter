@@ -39,7 +39,9 @@ export function settingsPath(env = process.env, home = homedir()) {
 export function readSettings(file = settingsPath()) {
   try {
     const raw = readFileSync(file, 'utf8')
-    const parsed = JSON.parse(raw)
+    // 去掉 UTF-8 BOM：Windows 记事本 / PowerShell 写的 JSON 常带 BOM，
+    // JSON.parse 会直接抛 "Unexpected token '﻿'"，导致设置被静默忽略。
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''))
     if (!parsed || typeof parsed !== 'object') return null
     return {
       gatewayBaseUrl: typeof parsed.gatewayBaseUrl === 'string' ? parsed.gatewayBaseUrl : '',

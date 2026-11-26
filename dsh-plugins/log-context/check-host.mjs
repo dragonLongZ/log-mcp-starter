@@ -163,6 +163,24 @@ try {
   }
   console.log('OK URL 校验拒绝非法值')
 
+  // 4e) 别人安装的场景：patch 里没有 projectDir、本地也没有 log_targets.yaml，
+  //     但 gateway 可达 —— 不能因此提示「配置文件读不到」。
+  settingsMod.writeSettings(
+    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://10.0.0.9:8000/mcp', token: 'tok-foreign' },
+    settingsFile,
+  )
+  const foreign = internals.resolveSettings(
+    { projectDir: join(tmpHome, 'not-a-repo') },
+    settingsFile,
+  )
+  const foreignCatalog = await internals.loadCatalog(foreign)
+  if (foreignCatalog.catalogSource !== 'gateway') throw new Error('gateway 可达时应以它为准')
+  if (foreignCatalog.configWarning !== null) {
+    throw new Error(`gateway 可用时不应提示本地 YAML 缺失：${foreignCatalog.configWarning}`)
+  }
+  if (foreignCatalog.assets.length === 0) throw new Error('应能从 gateway 拿到资产')
+  console.log('OK 陌生安装目录（无本地 YAML）:', foreignCatalog.assets.length, '资产 | 无多余告警')
+
   fs.rmSync(tmpHome, { recursive: true, force: true })
 
   // 5) MCP 状态与手动重连（伪造 tools / loader 服务，不触碰真实运行时）

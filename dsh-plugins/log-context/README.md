@@ -3,6 +3,46 @@
 把本仓库已有的 JumpServer 日志查询能力做成 DSH 插件：右栏点选「资产 / 模块」或「K8S 命名空间 / Pod」，
 一键把这次要查的坐标写进输入框，于是你只需要补一句「什么问题」，不必每次口述资产和目录。
 
+## 给别人用（多用户共享一个网关）
+
+插件已做到**装好即可用、不用改任何文件**：连接信息在右栏「连接设置」里填，存在
+`$DSH_HOME/log-context/settings.json`，不依赖本仓库路径（`cordis.patch.yml` 里没有硬编码路径）。
+
+对方需要拿到三样东西（都由你提供）：
+
+| 项 | 值 |
+|---|---|
+| 网关地址 | `http://10.12.0.101:8765` |
+| MCP 地址 | `http://10.12.0.101:8000/mcp` |
+| 访问令牌 | 服务器上 `local.token` 的内容 |
+
+他安装插件 → 打开右栏「连接设置」→ 填三项 → 点「试连」（同时校验网关与 MCP）→ 保存。
+
+### ⚠️ 当前的安全边界（务必先看）
+
+**token 是全局共享的一把，没有按用户 / 资产做授权。** 拿到 token 的人：
+
+- 能查询**全部资产**的日志与系统信息；
+- 能通过 `/dashboard/targets` **新增 / 修改 / 删除资产**（等于能让你的服务器去 SSH 任意地址）；
+- 能改自定义命令白名单。
+
+给出 token 之前至少要做：
+
+1. **关掉网页写权限**（`config/settings.yaml`）：
+   ```yaml
+   dashboard:
+     write_enabled: false
+   ```
+2. **确认网关只在内网 / VPN 可达**，不要暴露公网。
+3. 想清楚是否愿意让所有人看所有资产——若不愿意，需要「多 token + 资产级授权」，当前版本**没有**这个能力。
+
+### 分发方式
+
+- **直接给目录**：`dsh-plugins/log-context/`，对方用 `plugin_manager(install_bundle, target="<该路径>")` 安装。
+  **不要把 `.token` 一起发出去**，让他用自己的 `settings.json`。
+- **发布成 npm 包**：去掉 `"private": true`、把 `name` 改成带 scope 的包名（如 `@yourorg/dsh-log-context`），
+  `npm publish` 后对方 `install_bundle, target="@yourorg/dsh-log-context"`。
+
 ```
 ┌ 右栏：日志上下文 ──────────────┐
 │ ● 日志上下文        [刷新]      │
