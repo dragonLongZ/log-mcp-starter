@@ -152,22 +152,77 @@ dashboard:
 `dsh-plugins/log-context/` 是同一套能力的 DSH 插件：右栏点选「环境 → 资产 → 模块 / K8S 命名空间、Pod → 动作模板」，
 一键把「查哪里」写进对话输入框，你只需要补一句问题。详见 [dsh-plugins/log-context/README.md](dsh-plugins/log-context/README.md)。
 
+它已发布到 npm：[`@zxlll/dsh-log-context`](https://www.npmjs.com/package/@zxlll/dsh-log-context)，**推荐直接用 `dsh` 命令安装**，不需要 clone 本仓库。
+
 它由两部分组成，都不改动上面的 Python 业务代码：
 
 1. **能力**：bundle patch 插入 `@deepseek-ai/dsh-mcp-client`，连本项目的 `mcp_server.py`，
    模型拿到 `mcp__logmcp__*` 工具；并追加一段系统提示，看到「【日志上下文】」块就直接按块内坐标查询。
 2. **交互**：Host 半读 gateway `/targets`（本地 `config/log_targets.yaml` 仅作可选补充，缺失时自动降级）并提供 `/log-context/api`；Client 半注册右栏「日志上下文」标签页与输入框左侧入口按钮。
 
-安装（DSH 会话里执行）：
+### 用 dsh 命令安装（推荐）
+
+在**终端**里执行（不是在 DSH 会话里），`<profile>` 换成你自己的 profile 名（如 `web`）：
+
+```bash
+dsh plugin --profile web add @zxlll/dsh-log-context
+```
+
+一条命令做三件事：pnpm 把包装进 profile、把它写进依赖、把它追加到 `dsh.profile.bundles` 组合包列表。
+装完重启 DSH（或让它热重载），右栏就会出现「日志上下文」标签页，输入框左侧也会出现入口按钮。
+
+常用变体：
+
+```bash
+dsh plugin --profile web add @zxlll/dsh-log-context@0.1.1   # 锁定版本
+dsh plugin --profile web remove @zxlll/dsh-log-context      # 卸载
+dsh plugin --profile web list                               # 看装了哪些包
+```
+
+> `dsh plugin` 就是在 profile 目录里转发给 **pnpm**，所以本机需要装好 pnpm；报 `pnpm was not found` 先装 pnpm。
+> 版本要求：包声明 `engines.dsh = ^0.2.2-rc.1`，DSH 版本不在范围内会被拒绝并要求显式豁免。
+>
+> ⚠️ **0.1.0 不要用**：那一版 patch 里插件行还写着 `@local/dsh-log-context`，按 npm 包装会报
+> `Cannot find package '@local/dsh-log-context'`。请用 **0.1.1 及以上**（插件行改成相对路径 `./index.js`，
+> 客户端模块 id 对齐真实包名）。
+
+### 在 DSH 会话里安装
+
+也可以让会话里的 agent 代劳（它走同一条包管理通道）：
+
+```
+plugin_manager(install_bundle, target="@zxlll/dsh-log-context")
+```
+
+### 从本地目录安装（改插件源码时用）
 
 ```
 plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-plugins\\log-context")
 ```
 
-部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `10.12.0.101`（8000 = MCP，8765 = gateway），
-Windows 本机只跑 DSH。**地址与 token 在 DSH 右栏「日志上下文」→「连接设置」里填**，保存在
+或 `dsh plugin --profile web add ./dsh-plugins/log-context`。两种安装形态都支持：
+`cordis.patch.yml` 里的插件行用的是相对路径 `./index.js`，相对 patch 文件解析，不依赖包被装到哪个名字下。
+
+### 装完要填的三项
+
+**地址与 token 在 DSH 右栏「日志上下文」→「连接设置」里填**，保存在
 `$DSH_HOME/log-context/settings.json`（默认 `~/.dsh/log-context/settings.json`），不进 git、也不用改文件。
-`cordis.patch.yml` 里的 `url` / `gatewayBaseUrl` 只是出厂默认值，设置文件缺失时才生效。
+
+| 字段 | 示例 |
+|---|---|
+| 网关地址 | `http://10.12.0.101:8765` |
+| MCP 地址 | `http://10.12.0.101:8000/mcp` |
+| 访问令牌 | 服务器上 `local.token` 的内容 |
+
+填完点「试连」验证，再「保存」，MCP 行会自动重启一次生效。`cordis.patch.yml` 里的
+`url` / `gatewayBaseUrl` 只是出厂默认值，设置文件缺失时才生效。
+
+部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `10.12.0.101`（8000 = MCP，8765 = gateway），
+Windows 本机只跑 DSH。
+
+> ⚠️ token 是全局共享的一把，没有按用户/资产授权。对外给 token 前请把 `dashboard.write_enabled` 设为 `false`，
+> 并确认网关只在内网/VPN 可达。
+
 
 ## 部署模式
 

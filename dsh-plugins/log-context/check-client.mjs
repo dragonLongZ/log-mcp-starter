@@ -58,7 +58,7 @@ const script = new Function('window', `${source}\n//# sourceURL=log-context-clie
 script(globalThis.window)
 
 if (!captured) throw new Error('client.js 未调用 __ModuleLoader__.load')
-if (captured.id !== '@local/dsh-log-context') throw new Error(`意外的模块 id: ${captured.id}`)
+if (captured.id !== '@zxlll/dsh-log-context') throw new Error(`意外的模块 id: ${captured.id}`)
 console.log('OK 模块 id:', captured.id)
 
 const plugin = captured.factory(requireStub)

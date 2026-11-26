@@ -34,7 +34,10 @@
           maxDelayMs: 30000
 
     - id: log-context
-      name: '@local/dsh-log-context'
+      # 相对路径 = 「与本 patch 文件同级」，由 Loader 解析成 file:// 绝对地址。
+      # 这样同一份文件在两种安装方式下都能用：npm 包（node_modules 里）与本地目录 link，
+      # 不必知道包被装到了哪个名字下。
+      name: './index.js'
       config:
         # 留空 = 用「插件所在目录」推断项目根，因此别人安装到任意路径都能用，
         # 不需要改这一行。只有想指向另一个仓库的 log_targets.yaml 时才填绝对路径。

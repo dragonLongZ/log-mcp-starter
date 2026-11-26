@@ -38,10 +38,31 @@
 
 ### 分发方式
 
-- **直接给目录**：`dsh-plugins/log-context/`，对方用 `plugin_manager(install_bundle, target="<该路径>")` 安装。
+**已发布到 npm：[`@zxlll/dsh-log-context`](https://www.npmjs.com/package/@zxlll/dsh-log-context)。**
+
+推荐让对方用 `dsh` 命令装（在终端，不在 DSH 会话里）：
+
+```bash
+dsh plugin --profile web add @zxlll/dsh-log-context
+```
+
+一条命令完成：pnpm 装包 → 写入 profile 依赖 → 追加进 `dsh.profile.bundles` 组合包列表。
+装完重启 DSH（或等热重载），右栏就有「日志上下文」标签页。卸载用
+`dsh plugin --profile web remove @zxlll/dsh-log-context`。
+
+也可以让 DSH 会话里的 agent 代劳：
+
+```
+plugin_manager(install_bundle, target="@zxlll/dsh-log-context")
+```
+
+- **直接给目录**（改源码时）：`dsh-plugins/log-context/`，对方用
+  `plugin_manager(install_bundle, target="<该路径>")`，或 `dsh plugin --profile web add ./dsh-plugins/log-context`。
   **不要把 `.token` 一起发出去**，让他用自己的 `settings.json`。
-- **发布成 npm 包**：去掉 `"private": true`、把 `name` 改成带 scope 的包名（如 `@yourorg/dsh-log-context`），
-  `npm publish` 后对方 `install_bundle, target="@yourorg/dsh-log-context"`。
+- **自己发新版本**：改完 `package.json` 的 `version` → `npm publish`。**不要**把 `name` 改回 `@local/...`：
+  `client.js` 的模块 id 必须与 `package.json` 的 `name` 一致，否则客户端模块登记不上、右栏标签页不出现。
+  同理 `cordis.patch.yml` 的插件行用相对路径 `./index.js`，对 npm 安装和本地 link 都成立。
+
 
 ```
 ┌ 右栏：日志上下文 ──────────────┐
@@ -108,13 +129,39 @@ Windows 本机只跑 DSH。地址与 token 都**不用改文件**：在右栏「
 
 ## 安装
 
-在 DSH 会话里由 agent 执行（或让 agent 代劳）：
+**方式一：npm 包（推荐）** —— 在终端执行，`web` 换成你的 profile 名：
+
+```bash
+dsh plugin --profile web add @zxlll/dsh-log-context
+```
+
+`dsh plugin` 把参数转发给 profile 目录里的 pnpm，并在装完后自动把该包追加到
+`dsh.profile.bundles`，重启 DSH 后生效。需要本机有 pnpm。
+
+**方式二：本地目录**（改源码时）——在 DSH 会话里让 agent 执行：
 
 ```
 plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-plugins\\log-context")
 ```
 
-安装后即可在右栏看到标签页，输入框左侧也会出现「日志上下文」按钮。
+或终端 `dsh plugin --profile web add ./dsh-plugins/log-context`。
+
+装好后右栏即可看到标签页，输入框左侧也会出现「日志上下文」按钮。
+
+卸载：
+
+```bash
+dsh plugin --profile web remove @zxlll/dsh-log-context
+```
+
+### 升级
+
+```bash
+dsh plugin --profile web add @zxlll/dsh-log-context@0.1.1   # 指定新版本
+dsh plugin --profile web update                             # 或按 package.json 范围升级
+```
+
+升级后刷新页面（客户端包要重新下发）；Host 半改动需重启 DSH。
 
 ## 配置
 
@@ -154,14 +201,14 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
       maxDelayMs: 30000
 
 - id: log-context
-  name: '@local/dsh-log-context'
+  name: './index.js'                                 # 相对本 patch 文件；npm 包与本地目录都适用
   config:
     projectDir: 'D:/pythonProject/log-mcp-starter'   # 仅用于本地 YAML 兜底与默认 token 文件位置
     gatewayBaseUrl: 'http://127.0.0.1:8765'          # 出厂默认值，会被 settings.json 覆盖
 ```
 
 > `!!js` 表达式由 Loader 在插件上下文中求值，因此能动态算出绝对路径，不受工作目录影响。
-> 改动这段仍然需要 `remove_bundle` + `install_bundle`（或重启 DSH）；**改地址/token 则不需要**——走右栏保存即可。
+> 改动这段仍然需要重装/重启 bundle；**改地址/token 则不需要**——走右栏保存即可。
 
 ### log_targets.yaml 的可选字段
 

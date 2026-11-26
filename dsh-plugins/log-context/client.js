@@ -7,7 +7,8 @@
  * 数据来自 Host 半的 POST /log-context/api；MCP 工具由 bundle 的另一个 patch 行接入。
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-log-context',
+  // 必须与 package.json 的 name 一致：client 模块系统按包名登记/查找模块。
+  id: '@zxlll/dsh-log-context',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -15,7 +16,7 @@ window.__ModuleLoader__.load({
     /** 右栏标签类型：openTab 用它打开页面。 */
     const KIND = 'log-context'
     /** 标签实现 id，也是 sidebar.right.pane.tab 槽的 key，必须全局唯一。 */
-    const IMPL_ID = '@local/dsh-log-context'
+    const IMPL_ID = '@zxlll/dsh-log-context'
     const API_URL = '/log-context/api'
     const STORAGE_KEY = 'dsh.log-context.v1'
 
