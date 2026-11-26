@@ -1,9 +1,11 @@
 {
-  "name": "@local/dsh-log-context",
+  "name": "@zxlll/dsh-log-context",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "JumpServer asset log context for DSH: pick an asset/module or K8S namespace in the right sidebar and insert the query context into the composer.",
+  "engines": {
+    "dsh": "^0.2.2-rc.1"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
