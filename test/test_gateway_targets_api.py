@@ -267,6 +267,30 @@ targets:
         # 读接口不受影响
         assert client.get("/dashboard/targets", headers=auth).status_code == 200
 
+    def test_write_disabled_also_blocks_allowlist_writes(self, client, auth, write_disabled):
+        """白名单也是写入：只读分享 token 时不能让人顺手扩权。"""
+        added = client.post("/dashboard/allowlist", headers=auth, json={"name": "htop"})
+        assert added.status_code == 403
+        assert "write_enabled" in added.json()["detail"]
+
+        deleted = client.delete("/dashboard/allowlist", headers=auth, params={"name": "htop"})
+        assert deleted.status_code == 403
+
+        # 读与试运行不受影响
+        assert client.get("/dashboard/allowlist", headers=auth).status_code == 200
+        assert client.post(
+            "/dashboard/allowlist/check", headers=auth, json={"command": "docker ps"}
+        ).status_code == 200
+
+    def test_allowlist_writes_work_when_enabled(self, client, auth):
+        """开关打开时白名单写入照常可用（避免修过头）。"""
+        assert client.post(
+            "/dashboard/allowlist", headers=auth, json={"name": "htop"}
+        ).status_code == 200
+        assert client.delete(
+            "/dashboard/allowlist", headers=auth, params={"name": "htop"}
+        ).status_code == 200
+
 
 class TestConfigWarnings:
     def test_broken_row_surfaces_as_warning(self, client, auth):

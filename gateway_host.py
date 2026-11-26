@@ -1292,7 +1292,12 @@ async def dashboard_allowlist_add(
     body: AllowlistAddRequest,
     _: None = Depends(check_bearer),
 ) -> dict[str, Any]:
-    """新增/覆盖一条自定义白名单；写盘后下一次校验立即生效（无需重启）。"""
+    """新增/覆盖一条自定义白名单；写盘后下一次校验立即生效（无需重启）。
+
+    这是**写入**，与资产写接口同属「能改变网关行为」的一类，因此共用
+    ``dashboard.write_enabled`` 开关：只读分享 token 时不能让人顺手扩权。
+    """
+    require_writes_enabled()
     try:
         entries = add_entry(body.name, denied=body.denied, note=body.note)
     except AllowlistError as exc:
@@ -1305,7 +1310,11 @@ async def dashboard_allowlist_delete(
     name: str,
     _: None = Depends(check_bearer),
 ) -> dict[str, Any]:
-    """删除一条自定义白名单；删除后该命令重新回到 UNKNOWN。"""
+    """删除一条自定义白名单；删除后该命令重新回到 UNKNOWN。
+
+    同 ``POST``：属于写入，受 ``dashboard.write_enabled`` 约束。
+    """
+    require_writes_enabled()
     try:
         entries = remove_entry(name)
     except AllowlistError as exc:
