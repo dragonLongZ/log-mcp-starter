@@ -129,34 +129,34 @@ const internals = plugin.internals
 if (!internals) throw new Error('缺少 internals 测试出口')
 const linuxPrompt = internals.buildPrompt({
   asset: {
-    key: 'server-172.26.73.42-2.0-prod',
-    description: '2.0云平台生产环境jumpserver资产的ip尾号为11的服务器',
+    key: 'server-192.0.2.10-2.0-prod',
+    description: '2.0 平台生产环境示例资产',
     kind: 'linux',
-    modules: [{ name: 'member', description: '会员服务', logDir: '/data/logs/parking/member' }],
+    modules: [{ name: 'app', description: '应用服务', logDir: '/data/logs/demo/app' }],
   },
-  moduleName: 'member',
+  moduleName: 'app',
   template: internals.LINUX_TEMPLATES[0],
   keyword: '',
   day: 'today',
   customDay: '',
 })
 const k8sPrompt = internals.buildPrompt({
-  asset: { key: 'server-172.26.73.83-2.0-dev', description: '2.0平台研发环境 K8s 资产节点', kind: 'k8s', modules: [] },
+  asset: { key: 'server-192.0.2.12-2.0-dev', description: '2.0 平台研发环境 K8s 资产节点', kind: 'k8s', modules: [] },
   moduleName: '',
   template: internals.K8S_TEMPLATES[0],
   keyword: '',
   day: 'today',
   customDay: '',
-  namespace: 'parking-prod',
-  pod: 'cyf-cloud-parking-7d9f-abc',
+  namespace: 'app-prod',
+  pod: 'demo-app-7d9f-abc',
 })
 console.log('--- Linux 提示词 ---')
 console.log(linuxPrompt)
 console.log('--- K8S 提示词 ---')
 console.log(k8sPrompt)
 
-if (!linuxPrompt.includes('/data/logs/parking/member')) throw new Error('Linux 提示词缺少日志目录')
-if (!k8sPrompt.includes('parking-prod') || !k8sPrompt.includes('cyf-cloud-parking-7d9f-abc')) {
+if (!linuxPrompt.includes('/data/logs/demo/app')) throw new Error('Linux 提示词缺少日志目录')
+if (!k8sPrompt.includes('app-prod') || !k8sPrompt.includes('demo-app-7d9f-abc')) {
   throw new Error('K8S 提示词缺少命名空间/Pod')
 }
 console.log('全部检查通过')

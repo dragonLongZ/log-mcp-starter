@@ -15,7 +15,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const settings = {
   projectDir: join(here, '..', '..'),
   tokenPath: join(here, '.token'),
-  gatewayBaseUrl: process.env.LOG_CONTEXT_GATEWAY ?? 'http://10.12.0.101:8765',
+  gatewayBaseUrl: process.env.LOG_CONTEXT_GATEWAY ?? 'http://127.0.0.1:8765',
 }
 
 console.log('目标 gateway:', settings.gatewayBaseUrl)

@@ -12,8 +12,8 @@
 
 | 项 | 值 |
 |---|---|
-| 网关地址 | `http://10.12.0.101:8765` |
-| MCP 地址 | `http://10.12.0.101:8000/mcp` |
+| 网关地址 | `http://<gateway-host>:8765` |
+| MCP 地址 | `http://<gateway-host>:8000/mcp` |
 | 访问令牌 | 服务器上 `local.token` 的内容 |
 
 他安装插件 → 打开右栏「连接设置」→ 填三项 → 点「试连」（同时校验网关与 MCP）→ 保存。
@@ -69,9 +69,9 @@ plugin_manager(install_bundle, target="@zxlll/dsh-log-context")
 │ ● 日志上下文        [刷新]      │
 │ 环境  [全部][生产][测试][研发]  │
 │ 🔍 搜索资产 / IP / 模块         │
-│ ● server-172.26.73.42-2.0-prod │
-│ ● server-172.26.73.47-2.0-prod │
-│ 模块  ◉ member  会员服务        │
+│ ● server-192.0.2.10-2.0-prod    │
+│ ● server-192.0.2.11-2.0-prod    │
+│ 模块  ◉ app  应用服务           │
 │ 动作  [查今天 error][最近200行] │
 │ 预览  【日志上下文】…            │
 │ [插入到输入框] [直接发送]       │
@@ -82,9 +82,9 @@ plugin_manager(install_bundle, target="@zxlll/dsh-log-context")
 
 ```
 【日志上下文】
-资产：server-172.26.73.42-2.0-prod（2.0云平台生产环境…）
-模块：member（会员服务）
-日志目录：/data/logs/parking/member
+资产：server-192.0.2.10-2.0-prod（2.0 平台生产环境…）
+模块：app（应用服务）
+日志目录：/data/logs/demo/app
 时间范围：今天（today）
 日志类型：error 优先
 动作：搜索今天 error 日志中的异常…
@@ -107,12 +107,12 @@ Host 半**不改动** Python 侧业务逻辑，只读取配置并调用 gateway 
 
 ## 部署形态
 
-本项目按 README 的「远程部署」使用：`gateway_host.py` 和 `mcp_server.py` 都跑在服务器上（示例为 **10.12.0.101**），
+本项目按 README 的「远程部署」使用：`gateway_host.py` 和 `mcp_server.py` 都跑在服务器上（示例为 `127.0.0.1`，同机部署），
 
 | 服务 | 地址（示例） | 用途 |
 |---|---|---|
-| MCP | `http://10.12.0.101:8000/mcp` | 模型侧 `mcp__logmcp__*` 工具 |
-| gateway | `http://10.12.0.101:8765` | 资产配置、连接状态、kubectl 只读查询 |
+| MCP | `http://<gateway-host>:8000/mcp` | 模型侧 `mcp__logmcp__*` 工具 |
+| gateway | `http://<gateway-host>:8765` | 资产配置、连接状态、kubectl 只读查询 |
 
 实际地址在右栏「连接设置」里填，不用改文件。
 
@@ -120,7 +120,7 @@ Windows 本机只跑 DSH。地址与 token 都**不用改文件**：在右栏「
 
 ## 前置条件
 
-1. **远程** 10.12.0.101 上 `gateway_host.py` 与 `mcp_server.py` 都在运行，且 gateway 里已完成 JumpServer 认证
+1. **远程** 你的服务器上 `gateway_host.py` 与 `mcp_server.py` 都在运行，且 gateway 里已完成 JumpServer 认证
    （未认证的资产在面板里显示「未连接」，点「重连」会触发对应资产重新认证，密码 / MFA 在 gateway 终端完成）。
 2. 手上有该服务器上的 `local.token` 内容（网关与 MCP 共用同一把）。
 3. profile 里安装了本 bundle（见下）。
@@ -141,7 +141,7 @@ dsh plugin --profile web add @zxlll/dsh-log-context
 **方式二：本地目录**（改源码时）——在 DSH 会话里让 agent 执行：
 
 ```
-plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-plugins\\log-context")
+plugin_manager(install_bundle, target="<仓库根目录>\\dsh-plugins\\log-context")
 ```
 
 或终端 `dsh plugin --profile web add ./dsh-plugins/log-context`。
@@ -157,7 +157,7 @@ dsh plugin --profile web remove @zxlll/dsh-log-context
 ### 升级
 
 ```bash
-dsh plugin --profile web add @zxlll/dsh-log-context@0.1.1   # 指定新版本
+dsh plugin --profile web add @zxlll/dsh-log-context@0.1.2   # 指定新版本
 dsh plugin --profile web update                             # 或按 package.json 范围升级
 ```
 
@@ -171,9 +171,9 @@ dsh plugin --profile web update                             # 或按 package.jso
 
 | 字段 | 说明 | 示例 |
 |---|---|---|
-| 网关地址 | 资产目录、连接状态、kubectl 只读查询 | `http://10.12.0.101:8765` |
-| MCP 地址 | 模型侧 `mcp__logmcp__*` 工具 | `http://10.12.0.101:8000/mcp` |
-| 访问令牌 | `local.token` 的内容 | `_TKs0MDWIb...` |
+| 网关地址 | 资产目录、连接状态、kubectl 只读查询 | `http://<gateway-host>:8765` |
+| MCP 地址 | 模型侧 `mcp__logmcp__*` 工具 | `http://<gateway-host>:8000/mcp` |
+| 访问令牌 | `local.token` 的内容 | `粘贴 local.token 的内容` |
 
 - 「试连」只发一次 `GET /health`，**不落盘**，用于先验证再保存。
 - 保存后**立即生效**：Host 半每次请求都重新读设置；MCP 行会自动重启一次，让新地址与新 token 生效。
@@ -203,7 +203,7 @@ dsh plugin --profile web update                             # 或按 package.jso
 - id: log-context
   name: './index.js'                                 # 相对本 patch 文件；npm 包与本地目录都适用
   config:
-    projectDir: 'D:/pythonProject/log-mcp-starter'   # 仅用于本地 YAML 兜底与默认 token 文件位置
+    projectDir: '<仓库根目录>'   # 仅用于本地 YAML 兜底与默认 token 文件位置
     gatewayBaseUrl: 'http://127.0.0.1:8765'          # 出厂默认值，会被 settings.json 覆盖
 ```
 
@@ -216,14 +216,14 @@ dsh plugin --profile web update                             # 或按 package.jso
 
 ```yaml
 targets:
-  server-172.26.73.83-2.0-dev:
+  server-192.0.2.12-2.0-dev:
     description: "2.0平台研发环境 K8s 资产节点"
-    ssh_username: "zhangxiaolong#root#172.26.73.83"
+    ssh_username: "deploy#root#192.0.2.12"
     kind: k8s                    # 可选：k8s | linux；缺省按 description 里是否含 K8s 推断
     env: "研发"                   # 可选：环境名；缺省从 description 推断（生产/测试/研发/网关/演示）
     k8s:
       context: "2.0-dev"         # 可选：仅用于展示
-      namespaces: ["parking"]    # 可选：常用命名空间；不写就点「拉取」动态查
+      namespaces: ["app"]    # 可选：常用命名空间；不写就点「拉取」动态查
 ```
 
 ## 面板里能做什么
@@ -267,7 +267,7 @@ targets:
 ## 开发期自检
 
 ```powershell
-cd D:\pythonProject\log-mcp-starter
+cd <仓库根目录>
 node dsh-plugins/log-context/check-client.mjs    # Client 半：语法 + 注册 + 渲染 + 提示词（无网络）
 node dsh-plugins/log-context/check-host.mjs      # Host 半：假 gateway 验证 catalog/状态合并/离线降级（无网络）
 node dsh-plugins/log-context/check-settings.mjs  # 连接设置：保存/试连/掩码/损坏降级（无网络）

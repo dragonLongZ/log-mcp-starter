@@ -197,7 +197,7 @@ plugin_manager(install_bundle, target="@zxlll/dsh-log-context")
 ### 从本地目录安装（改插件源码时用）
 
 ```
-plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-plugins\\log-context")
+plugin_manager(install_bundle, target="<仓库根目录>\\dsh-plugins\\log-context")
 ```
 
 或 `dsh plugin --profile web add ./dsh-plugins/log-context`。两种安装形态都支持：
@@ -210,14 +210,14 @@ plugin_manager(install_bundle, target="D:\\pythonProject\\log-mcp-starter\\dsh-p
 
 | 字段 | 示例 |
 |---|---|
-| 网关地址 | `http://10.12.0.101:8765` |
-| MCP 地址 | `http://10.12.0.101:8000/mcp` |
+| 网关地址 | `http://<gateway-host>:8765` |
+| MCP 地址 | `http://<gateway-host>:8000/mcp` |
 | 访问令牌 | 服务器上 `local.token` 的内容 |
 
 填完点「试连」验证，再「保存」，MCP 行会自动重启一次生效。`cordis.patch.yml` 里的
 `url` / `gatewayBaseUrl` 只是出厂默认值，设置文件缺失时才生效。
 
-部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `10.12.0.101`（8000 = MCP，8765 = gateway），
+部署形态：`gateway_host.py` + `mcp_server.py` 跑在服务器 `<gateway-host>`（8000 = MCP，8765 = gateway），
 Windows 本机只跑 DSH。
 
 > ⚠️ token 是全局共享的一把，没有按用户/资产授权。对外给 token 前请把 `dashboard.write_enabled` 设为 `false`，

@@ -1,5 +1,5 @@
 /**
- * Host 半：把 log-mcp-starter 的资产配置变成 DSH 可读的「日志上下文」。
+ * Host 半：把本仓库的资产配置（`config/log_targets.yaml`）变成 DSH 可读的「日志上下文」。
  *
  * 职责只有三件事，都不碰 Python 侧业务逻辑：
  * 1. 读取 `config/log_targets.yaml`（支持 kind/env/k8s 等可选字段，缺省时从 description 推断），
@@ -258,12 +258,13 @@ const ENV_RULES = [
 ]
 const ENV_ORDER = ['prod', 'test', 'dev', 'gateway', 'demo', 'other']
 
+/**
+ * 平台标签只放通用版本号。
+ * 客户名 / 地名 / 项目代号属于私有信息，不要写进本文件：它会随 npm 包一起发布。
+ */
 const PLATFORM_RULES = [
   { id: '2.0', pattern: /2\.0/ },
   { id: '3.0', pattern: /3\.0/ },
-  { id: '佳木斯', pattern: /佳木斯/ },
-  { id: '雄安', pattern: /雄安/ },
-  { id: '北菜岗亭', pattern: /北菜|岗亭/ },
 ]
 
 /** 从 description 推断环境；显式 env 优先，并归一到同一个分类 id。 */
@@ -798,7 +799,7 @@ function createRestartTool(ctx) {
         if (result.readyAfter) {
           return `已重启 MCP 连接，${result.toolCount} 个 mcp__logmcp__* 工具恢复可用（重启前 ${result.readyBefore ? '可用' : '不可用'}）。`
         }
-        return `已触发重连，但工具仍未就绪（结果：${result.outcome}）。请确认 10.12.0.101:8000 可达、.token 正确，然后再次调用本工具或刷新日志上下文面板。`
+        return `已触发重连，但工具仍未就绪（结果：${result.outcome}）。请确认「连接设置」里的 MCP 地址与 token 正确，然后再次调用本工具或刷新日志上下文面板。`
       } catch (error) {
         return `重连 MCP 失败：${error?.message ?? String(error)}`
       }

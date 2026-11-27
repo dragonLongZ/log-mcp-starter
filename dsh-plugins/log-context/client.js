@@ -396,7 +396,7 @@ window.__ModuleLoader__.load({
           const result = await callApi('mcp.restart')
           if (result.readyAfter) setNotice(`MCP 已恢复：${result.toolCount} 个工具可用`)
           else if (result.outcome === 'pending') setNotice('已触发重连，连接仍在进行；几秒后点「刷新」确认')
-          else setNotice(`重连后工具仍未就绪（${result.outcome}）。检查 10.12.0.101:8000 可达与 .token 是否正确`)
+          else setNotice(`重连后工具仍未就绪（${result.outcome}）。检查「连接设置」里的 MCP 地址是否可达、token 是否正确`)
         } catch (failure) {
           setNotice(`重连 MCP 失败：${failure.message || String(failure)}`)
         } finally {
@@ -643,13 +643,13 @@ window.__ModuleLoader__.load({
                   { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
                   h('input', {
                     className: 'lc-input',
-                    placeholder: '网关地址，如 http://10.12.0.101:8765',
+                    placeholder: '网关地址，如 http://127.0.0.1:8765',
                     value: connForm.gatewayBaseUrl,
                     onChange: (event) => setConnForm((current) => ({ ...current, gatewayBaseUrl: event.target.value })),
                   }),
                   h('input', {
                     className: 'lc-input',
-                    placeholder: 'MCP 地址，如 http://10.12.0.101:8000/mcp',
+                    placeholder: 'MCP 地址，如 http://127.0.0.1:8000/mcp',
                     value: connForm.mcpUrl,
                     onChange: (event) => setConnForm((current) => ({ ...current, mcpUrl: event.target.value })),
                   }),

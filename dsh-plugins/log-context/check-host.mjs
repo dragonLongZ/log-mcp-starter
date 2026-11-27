@@ -8,13 +8,42 @@
 import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { internals } from './index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const PROJECT_DIR = join(here, '..', '..')
 const TOKEN_PATH = join(here, '.token')
 const FAKE_PORT = 18765
 const FAKE_BASE = `http://127.0.0.1:${FAKE_PORT}`
+
+/**
+ * 自检自带一份 log_targets.yaml，不读仓库里的私有配置：
+ * 这样别人 clone 下来也能跑，私有资产名也不会因此散落到仓库里。
+ */
+const FIXTURE_PROJECT_DIR = mkdtempSync(join(tmpdir(), 'log-context-proj-'))
+mkdirSync(join(FIXTURE_PROJECT_DIR, 'config'), { recursive: true })
+writeFileSync(
+  join(FIXTURE_PROJECT_DIR, 'config', 'log_targets.yaml'),
+  [
+    'targets:',
+    '  server-192.0.2.10-2.0-prod:',
+    '    description: "本地 YAML 描述（应被服务器端覆盖）"',
+    '    env: "生产"',
+    '    kind: linux',
+    '  server-192.0.2.12-2.0-dev:',
+    '    description: "2.0 平台研发环境 K8s 资产节点"',
+    '    kind: k8s',
+    '    k8s:',
+    '      context: "2.0-dev"',
+    '      namespaces: ["app"]',
+    '  server-192.0.2.13-2.0-test:',
+    '    description: "2.0 平台测试环境 K8s 资产节点"',
+    '    kind: k8s',
+    '',
+  ].join('\n'),
+  'utf8',
+)
 
 /** 假 gateway：/targets 故意只给两个资产，其中一个与本地 YAML 同名但内容不同，用来验证「服务器为准」。 */
 const server = createServer((req, res) => {
@@ -24,14 +53,14 @@ const server = createServer((req, res) => {
     res.end(body)
   }
   if (req.method === 'GET' && req.url === '/health') {
-    send(200, { assets_total: 2, assets_connected: 1, connected_servers: ['server-172.26.73.42-2.0-prod'] })
+    send(200, { assets_total: 2, assets_connected: 1, connected_servers: ['server-192.0.2.10-2.0-prod'] })
     return
   }
   if (req.method === 'GET' && req.url === '/connections') {
     send(200, {
       connections: [
-        { server: 'server-172.26.73.42-2.0-prod', state: 'connected', last_heartbeat: '2026-11-14T02:00:00Z', disconnect_reason: null },
-        { server: 'server-172-26-73-80-2.0-test', state: 'disconnected', last_heartbeat: null, disconnect_reason: 'SSH connection closed' },
+        { server: 'server-192.0.2.10-2.0-prod', state: 'connected', last_heartbeat: '2026-11-14T02:00:00Z', disconnect_reason: null },
+        { server: 'server-192-0-2-13-2.0-test', state: 'disconnected', last_heartbeat: null, disconnect_reason: 'SSH connection closed' },
       ],
     })
     return
@@ -39,9 +68,9 @@ const server = createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/targets') {
     send(200, {
       targets: {
-        'server-172.26.73.42-2.0-prod': {
-          description: 'REMOTE-DESCRIPTION 2.0云平台生产环境',
-          modules: { member: { log_dir: '/remote/member', description: '服务器端模块描述' } },
+        'server-192.0.2.10-2.0-prod': {
+          description: 'REMOTE-DESCRIPTION 2.0 平台生产环境',
+          modules: { app: { log_dir: '/remote/app', description: '服务器端模块描述' } },
           connection: { state: 'connected' },
         },
         'server-remote-only-1': {
@@ -60,8 +89,8 @@ const server = createServer((req, res) => {
     req.on('end', () => {
       const parsed = JSON.parse(body || '{}')
       const stdout = parsed.command.includes('namespaces')
-        ? 'namespace/default\nnamespace/parking-prod\nnamespace/kube-system\n'
-        : 'pod/cyf-cloud-parking-7d9f-abc\npod/cyf-cloud-cache-5f8b-xyz\n'
+        ? 'namespace/default\nnamespace/app-prod\nnamespace/kube-system\n'
+        : 'pod/demo-app-7d9f-abc\npod/demo-cache-5f8b-xyz\n'
       send(200, {
         results: [{ server: parsed.servers[0], executed_command: parsed.command, exit_code: 0, stdout, stderr: '', possibly_truncated_by_bytes: false }],
       })
@@ -75,7 +104,7 @@ await new Promise((resolve) => server.listen(FAKE_PORT, '127.0.0.1', resolve))
 console.log(`假 gateway 已监听 ${FAKE_BASE}`)
 
 try {
-  const settings = { projectDir: PROJECT_DIR, tokenPath: TOKEN_PATH, gatewayBaseUrl: FAKE_BASE }
+  const settings = { projectDir: FIXTURE_PROJECT_DIR, tokenPath: TOKEN_PATH, gatewayBaseUrl: FAKE_BASE }
 
   // 1) 在线：服务器 /targets 为准，本地 YAML 补可选字段
   const catalog = await internals.loadCatalog(settings)
@@ -83,10 +112,10 @@ try {
   console.log('OK gateway: reachable =', catalog.gateway.reachable, '| connected =', catalog.gateway.connected, '/', catalog.gateway.total)
   if (catalog.catalogSource !== 'gateway') throw new Error('/targets 可用时应以服务器配置为准')
 
-  const prod = catalog.assets.find((asset) => asset.key === 'server-172.26.73.42-2.0-prod')
+  const prod = catalog.assets.find((asset) => asset.key === 'server-192.0.2.10-2.0-prod')
   if (!prod) throw new Error('缺少生产资产')
   if (!prod.description.startsWith('REMOTE-DESCRIPTION')) throw new Error('资产描述没有采用服务器端配置')
-  if (prod.modules[0]?.logDir !== '/remote/member') throw new Error('模块目录没有采用服务器端配置')
+  if (prod.modules[0]?.logDir !== '/remote/app') throw new Error('模块目录没有采用服务器端配置')
   if (prod.connection?.state !== 'connected') throw new Error('连接状态未合并')
   console.log('OK 服务器为准: description =', prod.description.slice(0, 20), '| module.logDir =', prod.modules[0].logDir, '| state =', prod.connection.state)
 
@@ -100,7 +129,7 @@ try {
   console.log('OK 只存在于服务器端的资产已并入:', remoteOnly.key)
 
   // 2) kubectl 输出解析
-  const namespaces = internals.parseKubectlNames('namespace/default\nnamespace/parking-prod\n')
+  const namespaces = internals.parseKubectlNames('namespace/default\nnamespace/app-prod\n')
   if (namespaces[0] !== 'default') throw new Error('kubectl 名称解析不正确')
   console.log('OK kubectl 解析:', namespaces.join(','))
 
@@ -126,7 +155,7 @@ try {
 
   // 4a) 用户保存的设置优先于 patch config（这是「右栏可配」的核心）
   settingsMod.writeSettings(
-    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://10.0.0.9:8000/mcp', token: 'tok-from-settings' },
+    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://192.0.2.20:8000/mcp', token: 'tok-from-settings' },
     settingsFile,
   )
   const saved = internals.resolveSettings(
@@ -134,7 +163,7 @@ try {
     settingsFile,
   )
   if (saved.gatewayBaseUrl !== FAKE_BASE) throw new Error('设置文件里的网关地址未优先生效')
-  if (saved.mcpUrl !== 'http://10.0.0.9:8000/mcp') throw new Error('设置文件里的 MCP 地址未生效')
+  if (saved.mcpUrl !== 'http://192.0.2.20:8000/mcp') throw new Error('设置文件里的 MCP 地址未生效')
   if (saved.token !== 'tok-from-settings') throw new Error('设置文件里的 token 未生效')
   console.log('OK 设置优先:', saved.gatewayBaseUrl, '| mcp =', saved.mcpUrl, '| token 来源 =', saved.source.token)
 
@@ -166,7 +195,7 @@ try {
   // 4e) 别人安装的场景：patch 里没有 projectDir、本地也没有 log_targets.yaml，
   //     但 gateway 可达 —— 不能因此提示「配置文件读不到」。
   settingsMod.writeSettings(
-    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://10.0.0.9:8000/mcp', token: 'tok-foreign' },
+    { gatewayBaseUrl: FAKE_BASE, mcpUrl: 'http://192.0.2.20:8000/mcp', token: 'tok-foreign' },
     settingsFile,
   )
   const foreign = internals.resolveSettings(
@@ -222,4 +251,5 @@ try {
   console.log('Host 半全部检查通过')
 } finally {
   server.close()
+  rmSync(FIXTURE_PROJECT_DIR, { recursive: true, force: true })
 }

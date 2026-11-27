@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -100,9 +101,9 @@ class TestValidation:
     def test_allows_hash_in_ssh_username(self):
         """JumpServer 的用户名格式是 user#role#ip，# 必须放行。"""
         entry = config_store.validate_target("srv-a", make_target(
-            ssh_username="zhangxiaolong#readonly#172.26.73.39"
+            ssh_username="deploy#readonly#192.0.2.39"
         ))
-        assert entry["ssh_username"] == "zhangxiaolong#readonly#172.26.73.39"
+        assert entry["ssh_username"] == "deploy#readonly#192.0.2.39"
 
     def test_linux_target_may_have_no_modules(self):
         """现网存在只做系统查询的资产（无模块），迁移时不能被丢弃。"""
@@ -400,8 +401,9 @@ class TestSettings:
         assert "jumpserver" in raw and raw["jumpserver"]["host"]
         assert "." in raw["jumpserver"]["host"]
         text = example.read_text(encoding="utf-8")
-        for leaked in ("cheyifu", "10.12.0.101", "172.26."):
-            assert leaked not in text, f"示例文件不应包含内网标识：{leaked}"
+        # 示例文件里不允许出现任何 RFC1918 内网地址（10/8、172.16/12、192.168/16）
+        leaked = re.search(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b", text)
+        assert leaked is None, f"示例文件不应包含内网地址：{leaked.group(0)}"
         # 复制成 settings.yaml 后应当能被正常加载
         import shutil
 
